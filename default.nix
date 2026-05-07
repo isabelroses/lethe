@@ -9,10 +9,8 @@ in
 {
   nixpkgs ? nixpkgs',
   system ? builtins.currentSystem,
+  pkgs ? import nixpkgs { inherit system; },
 }:
-let
-  pkgs = import nixpkgs { inherit system; };
-in
 {
   lethe = pkgs.callPackage ./package.nix { };
 }
