@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-const SCHEMA: &str = r"
+pub(crate) const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS machines (
     id INTEGER PRIMARY KEY,
     identifier TEXT NOT NULL UNIQUE

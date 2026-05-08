@@ -236,6 +236,7 @@ pub fn diff(conn: &Connection, old: &str, new: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(test, derive(Debug))]
 struct DeploymentRow {
     id: i64,
     target_machine_id: i64,
@@ -476,5 +477,150 @@ fn format_size(bytes: i64) -> String {
         format!("-{s}")
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(db::SCHEMA).unwrap();
+        conn
+    }
+
+    fn add_machine(conn: &Connection, identifier: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO machines (identifier) VALUES (?1)",
+            params![identifier],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn add_deployment(conn: &Connection, machine_id: i64, toplevel: &str, size: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO deployments (target_machine_id, toplevel, size) VALUES (?1, ?2, ?3)",
+            params![machine_id, toplevel, size],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn resolve_by_id() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+
+        let dep = resolve_deployment(&conn, &d1.to_string()).unwrap();
+        assert_eq!(dep.id, d1);
+        assert_eq!(dep.toplevel, "/nix/store/aaa-system");
+    }
+
+    #[test]
+    fn resolve_by_toplevel() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+
+        let dep = resolve_deployment(&conn, "/nix/store/aaa-system").unwrap();
+        assert_eq!(dep.id, d1);
+    }
+
+    #[test]
+    fn resolve_unknown_ref_errors() {
+        let conn = fresh_conn();
+        add_machine(&conn, "host-a");
+
+        let err = resolve_deployment(&conn, "/nix/store/nope-system").unwrap_err();
+        assert!(err.to_string().contains("no deployment"));
+    }
+
+    #[test]
+    fn resolve_ambiguous_toplevel_errors() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        add_deployment(&conn, m, "/nix/store/dup-system", 100);
+        add_deployment(&conn, m, "/nix/store/dup-system", 200);
+
+        let err = resolve_deployment(&conn, "/nix/store/dup-system").unwrap_err();
+        assert!(err.to_string().contains("matches 2 deployments"));
+    }
+
+    #[test]
+    fn diff_pair_two_args_resolves_both() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+        let d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
+
+        let (old, new) =
+            resolve_diff_pair(&conn, &d1.to_string(), Some("/nix/store/bbb-system")).unwrap();
+        assert_eq!(old.id, d1);
+        assert_eq!(new.id, d2);
+    }
+
+    #[test]
+    fn diff_pair_single_id_uses_latest_for_machine() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+        let _d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
+        let d3 = add_deployment(&conn, m, "/nix/store/ccc-system", 300);
+
+        let (old, new) = resolve_diff_pair(&conn, &d1.to_string(), None).unwrap();
+        assert_eq!(old.id, d1);
+        assert_eq!(new.id, d3);
+    }
+
+    #[test]
+    fn diff_pair_machine_name_uses_last_two() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        let _d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+        let d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
+        let d3 = add_deployment(&conn, m, "/nix/store/ccc-system", 300);
+
+        let (old, new) = resolve_diff_pair(&conn, "host-a", None).unwrap();
+        assert_eq!(old.id, d2);
+        assert_eq!(new.id, d3);
+    }
+
+    #[test]
+    fn diff_pair_machine_with_one_deployment_errors() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+
+        let err = resolve_diff_pair(&conn, "host-a", None).unwrap_err();
+        assert!(err.to_string().contains("fewer than two deployments"));
+    }
+
+    #[test]
+    fn diff_pair_unknown_single_ref_errors() {
+        let conn = fresh_conn();
+        add_machine(&conn, "host-a");
+
+        let err = resolve_diff_pair(&conn, "host-b", None).unwrap_err();
+        assert!(err.to_string().contains("no deployment, toplevel, or machine"));
+    }
+
+    #[test]
+    fn diff_pair_id_lookup_does_not_match_unrelated_machine() {
+        let conn = fresh_conn();
+        let m_a = add_machine(&conn, "host-a");
+        let m_b = add_machine(&conn, "host-b");
+        let d_a = add_deployment(&conn, m_a, "/nix/store/aaa-system", 100);
+        let _d_b1 = add_deployment(&conn, m_b, "/nix/store/bbb-system", 200);
+        let _d_b2 = add_deployment(&conn, m_b, "/nix/store/ccc-system", 300);
+
+        let (old, new) = resolve_diff_pair(&conn, &d_a.to_string(), None).unwrap();
+        assert_eq!(old.id, d_a);
+        assert_eq!(new.id, d_a);
+        assert_eq!(new.target_machine_id, m_a);
     }
 }
