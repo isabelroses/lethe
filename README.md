@@ -36,6 +36,8 @@ lethe deployments my-server # deployments for one machine
 lethe show 42               # details of a single deployment
 lethe diff 41 42            # diff two deployments (closure + size delta)
 lethe diff 41               # diff against the latest deployment of the same machine
+lethe diff my-server        # diff the last two deployments for a machine
+lethe diff /nix/store/...-nixos-system-foo 42  # ids and toplevel paths are interchangeable
 ```
 
 ## Data Storage

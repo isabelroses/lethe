@@ -189,27 +189,8 @@ pub fn show(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-pub fn diff(conn: &Connection, old_id: i64, new_id: Option<i64>) -> Result<()> {
-    let old_dep = load_deployment(conn, old_id)?;
-    let new_dep = match new_id {
-        Some(new_id) => load_deployment(conn, new_id)?,
-        None => conn.query_row(
-            "SELECT id, target_machine_id, toplevel, size, created_at
-             FROM deployments
-             WHERE target_machine_id = ?1
-             ORDER BY id DESC LIMIT 1",
-            params![old_dep.target_machine_id],
-            |r| {
-                Ok(DeploymentRow {
-                    id: r.get(0)?,
-                    target_machine_id: r.get(1)?,
-                    toplevel: r.get(2)?,
-                    size: r.get(3)?,
-                    created_at: r.get(4)?,
-                })
-            },
-        )?,
-    };
+pub fn diff(conn: &Connection, old: &str, new: Option<&str>) -> Result<()> {
+    let (old_dep, new_dep) = resolve_diff_pair(conn, old, new)?;
 
     let new_paths = load_closure_paths(conn, new_dep.id)?;
     let old_paths = load_closure_paths(conn, old_dep.id)?;
@@ -264,23 +245,116 @@ struct DeploymentRow {
     created_at: String,
 }
 
-fn load_deployment(conn: &Connection, id: i64) -> Result<DeploymentRow> {
-    conn.query_row(
+fn try_resolve_deployment(conn: &Connection, reference: &str) -> Result<Option<DeploymentRow>> {
+    if let Ok(id) = reference.parse::<i64>() {
+        return Ok(conn
+            .query_row(
+                "SELECT id, target_machine_id, toplevel, size, created_at
+                 FROM deployments WHERE id = ?1",
+                params![id],
+                row_to_deployment,
+            )
+            .optional()?);
+    }
+
+    let mut stmt = conn.prepare(
         "SELECT id, target_machine_id, toplevel, size, created_at
-         FROM deployments WHERE id = ?1",
-        params![id],
-        |r| {
-            Ok(DeploymentRow {
-                id: r.get(0)?,
-                target_machine_id: r.get(1)?,
-                toplevel: r.get(2)?,
-                size: r.get(3)?,
-                created_at: r.get(4)?,
-            })
-        },
-    )
-    .optional()?
-    .with_context(|| format!("unknown deployment: {id}"))
+         FROM deployments WHERE toplevel = ?1
+         ORDER BY id DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![reference], row_to_deployment)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    match rows.len() {
+        0 => Ok(None),
+        1 => Ok(Some(rows.into_iter().next().unwrap())),
+        _ => {
+            let ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
+            anyhow::bail!(
+                "toplevel {reference} matches {} deployments (ids: {}); pass an id to disambiguate",
+                rows.len(),
+                ids.join(", "),
+            )
+        }
+    }
+}
+
+fn resolve_deployment(conn: &Connection, reference: &str) -> Result<DeploymentRow> {
+    try_resolve_deployment(conn, reference)?
+        .with_context(|| format!("no deployment found with id or toplevel: {reference}"))
+}
+
+fn resolve_diff_pair(
+    conn: &Connection,
+    old: &str,
+    new: Option<&str>,
+) -> Result<(DeploymentRow, DeploymentRow)> {
+    if let Some(new) = new {
+        return Ok((resolve_deployment(conn, old)?, resolve_deployment(conn, new)?));
+    }
+
+    if let Some(old_dep) = try_resolve_deployment(conn, old)? {
+        let new_dep = latest_deployment_for_machine(conn, old_dep.target_machine_id)?
+            .with_context(|| format!("no deployments for machine id {}", old_dep.target_machine_id))?;
+        return Ok((old_dep, new_dep));
+    }
+
+    let machine_id: i64 = conn
+        .query_row(
+            "SELECT id FROM machines WHERE identifier = ?1",
+            params![old],
+            |r| r.get(0),
+        )
+        .optional()?
+        .with_context(|| {
+            format!("no deployment, toplevel, or machine matches: {old}")
+        })?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, target_machine_id, toplevel, size, created_at
+         FROM deployments WHERE target_machine_id = ?1
+         ORDER BY id DESC LIMIT 2",
+    )?;
+    let mut rows = stmt
+        .query_map(params![machine_id], row_to_deployment)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if rows.len() < 2 {
+        anyhow::bail!(
+            "machine {old} has fewer than two deployments ({})",
+            rows.len()
+        );
+    }
+    let new_dep = rows.remove(0);
+    let old_dep = rows.remove(0);
+    Ok((old_dep, new_dep))
+}
+
+fn latest_deployment_for_machine(
+    conn: &Connection,
+    machine_id: i64,
+) -> Result<Option<DeploymentRow>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, target_machine_id, toplevel, size, created_at
+             FROM deployments
+             WHERE target_machine_id = ?1
+             ORDER BY id DESC LIMIT 1",
+            params![machine_id],
+            row_to_deployment,
+        )
+        .optional()?)
+}
+
+fn row_to_deployment(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
+    Ok(DeploymentRow {
+        id: r.get(0)?,
+        target_machine_id: r.get(1)?,
+        toplevel: r.get(2)?,
+        size: r.get(3)?,
+        created_at: r.get(4)?,
+    })
 }
 
 fn load_closure_paths(conn: &Connection, deployment_id: i64) -> Result<Vec<(String, i64)>> {

@@ -66,11 +66,13 @@ enum Command {
 
     /// Diff two deployments
     Diff {
-        /// Old deployment id
-        old: i64,
+        /// Deployment id, toplevel /nix/store path, or machine identifier.
+        /// When a machine is given (and `new` is omitted), the last two
+        /// deployments for that machine are diffed.
+        old: String,
 
-        /// New deployment id (defaults to the latest deployment of the same machine)
-        new: Option<i64>,
+        /// New deployment (id or toplevel; defaults to the latest deployment of the same machine)
+        new: Option<String>,
     },
 
     /// Print a shell completion script to stdout
@@ -126,7 +128,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Machines => cli::machines(&conn),
         Command::Deployments { machine } => cli::deployments(&conn, &machine),
         Command::Show { id } => cli::show(&conn, id),
-        Command::Diff { old, new } => cli::diff(&conn, old, new),
+        Command::Diff { old, new } => cli::diff(&conn, &old, new.as_deref()),
         Command::Completions { .. } => unreachable!(),
     }
 }
