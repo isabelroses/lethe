@@ -17,6 +17,10 @@ struct Cli {
     #[arg(long, global = true, env = "LETHE_DB")]
     db: Option<PathBuf>,
 
+    /// Disable colored output (also respects `NO_COLOR` env var and CI environments)
+    #[arg(long, global = true)]
+    no_color: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -105,6 +109,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         clap_complete::generate(shell, &mut cmd, "lethe", &mut std::io::stdout());
         return Ok(());
     }
+
+    lix_diff::color::init(cli.no_color);
 
     let conn = db::open(cli.db)?;
     match cli.command {

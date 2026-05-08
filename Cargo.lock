@@ -561,11 +561,13 @@ dependencies = [
  "directories",
  "humansize",
  "lix-diff",
+ "nu-ansi-term",
  "regex",
  "rusqlite",
  "serde",
  "serde_json",
  "tabled",
+ "terminal-light",
  "tracing",
  "tracing-subscriber",
 ]

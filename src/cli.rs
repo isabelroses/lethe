@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use lix_diff::{PackageListDiff, color};
+use nu_ansi_term::{Color, Style as AnsiStyle};
 use rusqlite::{params, Connection, OptionalExtension};
 use tabled::settings::object::Columns;
 use tabled::settings::{Alignment, Modify, Style};
 use tabled::{Table, Tabled};
+use terminal_light::luma;
 use tracing::info;
 
 use crate::diff::{self, ClosurePathRef};
@@ -223,12 +225,25 @@ pub fn diff(conn: &Connection, old_id: i64, new_id: Option<i64>) -> Result<()> {
 
     let diff_root = diff::build_diff_root(&new_refs, &old_refs);
 
-    color::init(false);
     let mut packages = PackageListDiff::new();
     packages.show_size_delta = false;
     packages.from_diff_root(diff_root);
 
-    println!("Deployment {} vs {}", old_dep.id, new_dep.id);
+    let before_text = format!("<<< {}", old_dep.toplevel);
+    let after_text = format!(">>> {}", new_dep.toplevel);
+    if color::color_enabled() {
+        let text_color = if luma().is_ok_and(|l| l > 0.6) {
+            Color::DarkGray
+        } else {
+            Color::LightGray
+        };
+        let arrow_style = AnsiStyle::new().bold().fg(text_color);
+        println!("{}", arrow_style.paint(&before_text));
+        println!("{}", arrow_style.paint(&after_text));
+    } else {
+        println!("{before_text}");
+        println!("{after_text}");
+    }
     println!();
     print!("{packages}");
     println!(
@@ -243,7 +258,6 @@ pub fn diff(conn: &Connection, old_id: i64, new_id: Option<i64>) -> Result<()> {
 struct DeploymentRow {
     id: i64,
     target_machine_id: i64,
-    #[allow(dead_code)]
     toplevel: String,
     size: i64,
     #[allow(dead_code)]
