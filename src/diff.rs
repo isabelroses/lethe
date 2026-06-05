@@ -28,12 +28,14 @@ pub fn build_diff_root(
     for (name, new_group) in new_groups {
         match old_groups.remove(&name) {
             Some(old_group) if old_group != new_group => {
+                let (before, after) =
+                    collapse_changed(&old_group.versions, &new_group.versions);
                 packages.insert(
                     name,
                     DiffPackage {
                         size_delta: new_group.nar_size - old_group.nar_size,
-                        versions_before: old_group.versions,
-                        versions_after: new_group.versions,
+                        versions_before: before,
+                        versions_after: after,
                     },
                 );
             }
@@ -44,7 +46,7 @@ pub fn build_diff_root(
                     DiffPackage {
                         size_delta: new_group.nar_size,
                         versions_before: Vec::new(),
-                        versions_after: new_group.versions,
+                        versions_after: collapse_runs(&new_group.versions),
                     },
                 );
             }
@@ -56,7 +58,7 @@ pub fn build_diff_root(
             name,
             DiffPackage {
                 size_delta: -old_group.nar_size,
-                versions_before: old_group.versions,
+                versions_before: collapse_runs(&old_group.versions),
                 versions_after: Vec::new(),
             },
         );
@@ -65,6 +67,55 @@ pub fn build_diff_root(
     DiffRoot {
         packages,
         schema: String::new(),
+    }
+}
+
+/// Run-length encode consecutive identical versions, collapsing a run of `n`
+/// identical entries into a single `"<value> xN"` entry. Callers pass sorted
+/// lists, so identical versions are always adjacent. This keeps long stretches
+/// like `<none>, <none>, ...` from drowning out the diff.
+fn collapse_runs(versions: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < versions.len() {
+        let mut j = i + 1;
+        while j < versions.len() && versions[j] == versions[i] {
+            j += 1;
+        }
+        out.push(label(&versions[i], j - i));
+        i = j;
+    }
+    out
+}
+
+/// Like [`collapse_runs`] but for a changed package, where each `before`/`after`
+/// pair is rendered together. Runs of identical pairs are collapsed in lockstep
+/// so the two lists stay aligned for the downstream `before -> after` render.
+fn collapse_changed(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut out_before = Vec::new();
+    let mut out_after = Vec::new();
+    let paired = before.len().min(after.len());
+    let mut i = 0;
+    while i < paired {
+        let mut j = i + 1;
+        while j < paired && before[j] == before[i] && after[j] == after[i] {
+            j += 1;
+        }
+        out_before.push(label(&before[i], j - i));
+        out_after.push(label(&after[i], j - i));
+        i = j;
+    }
+    // Preserve any unpaired tail verbatim (matches the prior behavior).
+    out_before.extend(before[paired..].iter().cloned());
+    out_after.extend(after[paired..].iter().cloned());
+    (out_before, out_after)
+}
+
+fn label(version: &str, count: usize) -> String {
+    if count > 1 {
+        format!("{version} x{count}")
+    } else {
+        version.to_string()
     }
 }
 
@@ -108,4 +159,58 @@ fn group_packages(paths: &[ClosurePathRef<'_>]) -> HashMap<String, PackageGroup>
         group.versions.sort();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(items: &[&str]) -> Vec<String> {
+        items.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn collapses_identical_runs() {
+        assert_eq!(collapse_runs(&s(&["<none>"; 13])), s(&["<none> x13"]));
+        assert_eq!(
+            collapse_runs(&s(&["1.5.1", "1.5.1", "1.5.1"])),
+            s(&["1.5.1 x3"])
+        );
+    }
+
+    #[test]
+    fn keeps_singletons_uncollapsed() {
+        assert_eq!(
+            collapse_runs(&s(&["1.5.0", "1.5.1", "1.6.0"])),
+            s(&["1.5.0", "1.5.1", "1.6.0"])
+        );
+    }
+
+    #[test]
+    fn mixed_runs() {
+        assert_eq!(
+            collapse_runs(&s(&["1.5.0", "1.5.0", "1.5.1"])),
+            s(&["1.5.0 x2", "1.5.1"])
+        );
+    }
+
+    #[test]
+    fn changed_collapses_aligned_pairs() {
+        let before = s(&["<none>"; 13]);
+        let after = s(&["<none>"; 13]);
+        assert_eq!(
+            collapse_changed(&before, &after),
+            (s(&["<none> x13"]), s(&["<none> x13"]))
+        );
+    }
+
+    #[test]
+    fn changed_keeps_distinct_pairs_separate() {
+        let before = s(&["1.0", "1.0"]);
+        let after = s(&["2.0", "3.0"]);
+        assert_eq!(
+            collapse_changed(&before, &after),
+            (s(&["1.0", "1.0"]), s(&["2.0", "3.0"]))
+        );
+    }
 }
