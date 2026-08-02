@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
+use anyhow::{Context, Result, anyhow};
+use dix::store::StoreBackend;
+use dix::{CommandBackend, StorePath, StoreSnapshot};
+use tracing::debug;
 
 pub enum Target {
     Local,
@@ -12,6 +14,16 @@ pub enum Target {
 pub struct SshTarget {
     pub host: String,
     pub port: Option<u16>,
+}
+
+impl SshTarget {
+    /// The Nix `ssh://` store URL for this target.
+    pub fn store_url(&self) -> String {
+        match self.port {
+            Some(p) => format!("ssh://{}:{p}", self.host),
+            None => format!("ssh://{}", self.host),
+        }
+    }
 }
 
 /// Parse a target string of the form `host`, `user@host`, or
@@ -29,80 +41,81 @@ pub fn parse_ssh_target(raw: &str) -> SshTarget {
     SshTarget { host: stripped.to_string(), port: None }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StorePathInfo {
-    #[serde(default)]
-    pub path: String,
-    pub closure_size: i64,
-    pub nar_size: i64,
-    pub nar_hash: String,
-    // Legacy schema (Nix < 2.19 or lix) emits `valid` explicitly; the modern object
-    // schema only lists valid paths (invalid ones map to `null`), so default true.
-    #[serde(default = "default_true")]
-    pub valid: bool,
-    #[serde(default)]
-    pub deriver: Option<String>,
-    #[serde(default)]
-    pub references: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-// `nix path-info --json` switched shape in Nix 2.19: pre-2.19 (or lix which forked from 2.18)
-// returns an array with `path` as a field; 2.19+ returns an object keyed by store path with `null`
-// values for invalid paths. Accept both via untagged deserialization rather than probing `nix
-// --version`.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum PathInfoJson {
-    Legacy(Vec<StorePathInfo>),
-    Modern(HashMap<String, Option<StorePathInfo>>),
-}
-
 /// Resolve a system link (e.g. /run/current-system) to its store path.
 pub fn resolve_toplevel(target: &Target, link: &str) -> Result<String> {
-    let out = run(target, &["nix", "path-info", link])
-        .with_context(|| format!("resolving {link}"))?;
-    let path = out.trim();
-    if path.is_empty() {
-        anyhow::bail!("nix path-info {link} returned empty output");
-    }
-    Ok(path.to_string())
+    let resolved = match target {
+        Target::Local => std::fs::canonicalize(link)
+            .with_context(|| format!("resolving {link}"))?,
+        Target::Ssh(_) => {
+            let out = run(target, &["readlink", "-f", link])
+                .with_context(|| format!("resolving {link}"))?;
+            let path = out.trim();
+            if path.is_empty() {
+                anyhow::bail!("readlink -f {link} returned empty output");
+            }
+            PathBuf::from(path)
+        }
+    };
+
+    let store_path = StorePath::try_from(resolved)
+        .map_err(|e| anyhow!("{link} did not resolve to a nix store path: {e}"))?;
+    store_path
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("path {link} contains invalid unicode"))
 }
+
+const PROC_HOSTNAME: &str = "/proc/sys/kernel/hostname";
 
 /// Read the short hostname of the target system.
 pub fn fetch_hostname(target: &Target) -> Result<String> {
-    let out = run(target, &["hostname", "-s"]).context("fetching hostname")?;
-    let h = out.trim();
-    if h.is_empty() {
-        anyhow::bail!("hostname returned empty");
-    }
-    Ok(h.to_string())
+    let raw = match target {
+        // Avoids depending on `hostname(1)`, which isn't always installed.
+        Target::Local => match std::fs::read_to_string(PROC_HOSTNAME) {
+            Ok(raw) => raw,
+            Err(e) => {
+                debug!("reading {PROC_HOSTNAME} failed ({e}), falling back to hostname(1)");
+                run(target, &["hostname", "-s"]).context("fetching hostname")?
+            }
+        },
+        Target::Ssh(_) => run(target, &["hostname", "-s"]).context("fetching hostname")?,
+    };
+
+    short_hostname(&raw)
+        .map(str::to_string)
+        .context("hostname was empty")
 }
 
-/// Fetch the recursive closure with sizes for a system link.
-pub fn fetch_closure(target: &Target, link: &str) -> Result<Vec<StorePathInfo>> {
-    let out = run(
-        target,
-        &["nix", "path-info", "--closure-size", "-rsh", link, "--json"],
-    )
-    .context("running nix path-info --json")?;
-    let parsed: PathInfoJson =
-        serde_json::from_str(&out).context("parsing nix path-info JSON")?;
-    Ok(match parsed {
-        PathInfoJson::Legacy(v) => v,
-        PathInfoJson::Modern(m) => m
-            .into_iter()
-            .filter_map(|(path, info)| {
-                let mut info = info?;
-                info.path = path;
-                Some(info)
-            })
-            .collect(),
-    })
+/// Reduce a hostname to its short form the way `hostname -s` does, so a local
+/// `/proc` read and a remote `hostname -s` agree on the stored identifier.
+fn short_hostname(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let short = trimmed.split('.').next().unwrap_or(trimmed);
+    (!short.is_empty()).then_some(short)
+}
+
+/// Fetch the closure and the set of explicitly selected packages for a
+/// resolved toplevel store path.
+pub fn fetch_snapshot(target: &Target, toplevel: &str) -> Result<StoreSnapshot> {
+    let path = Path::new(toplevel);
+    match target {
+        Target::Local => dix::query_store_snapshot(path, true)
+            .map_err(|e| anyhow!("querying local nix store: {e}")),
+        Target::Ssh(t) => {
+            let mut backend = CommandBackend::default().store_url(t.store_url());
+            backend
+                .connect()
+                .map_err(|e| anyhow!("connecting to {}: {e}", t.host))?;
+            let snapshot = dix::query_store_snapshot_with_backend(&backend, path)
+                .map_err(|e| anyhow!("querying nix store on {}: {e}", t.host));
+            // Reported rather than propagated so a teardown failure can't mask
+            // the query error, which is the one worth seeing.
+            if let Err(e) = backend.close() {
+                debug!("closing connection to {}: {e}", t.host);
+            }
+            snapshot
+        }
+    }
 }
 
 fn run(target: &Target, argv: &[&str]) -> Result<String> {
@@ -138,61 +151,41 @@ fn run(target: &Target, argv: &[&str]) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn parse(json: &str) -> Vec<StorePathInfo> {
-        let parsed: PathInfoJson = serde_json::from_str(json).unwrap();
-        match parsed {
-            PathInfoJson::Legacy(v) => v,
-            PathInfoJson::Modern(m) => m
-                .into_iter()
-                .filter_map(|(path, info)| {
-                    let mut info = info?;
-                    info.path = path;
-                    Some(info)
-                })
-                .collect(),
-        }
+    #[test]
+    fn parses_ssh_target_host_only() {
+        let t = parse_ssh_target("example.com");
+        assert_eq!(t.host, "example.com");
+        assert_eq!(t.port, None);
     }
 
     #[test]
-    fn parses_legacy_array_schema() {
-        let json = r#"[{
-            "path": "/nix/store/aaa-foo",
-            "closureSize": 200,
-            "narSize": 100,
-            "narHash": "sha256:abc",
-            "valid": true,
-            "references": ["/nix/store/bbb-bar"]
-        }]"#;
-        let v = parse(json);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].path, "/nix/store/aaa-foo");
-        assert_eq!(v[0].closure_size, 200);
-        assert_eq!(v[0].references, vec!["/nix/store/bbb-bar"]);
+    fn parses_ssh_url_with_port() {
+        let t = parse_ssh_target("ssh://example.com:2222");
+        assert_eq!(t.host, "example.com");
+        assert_eq!(t.port, Some(2222));
     }
 
     #[test]
-    fn parses_modern_object_schema() {
-        // Mirrors real Nix 2.19+ output: no `valid` field, extra fields like
-        // `ca`/`registrationTime`/`ultimate`, and `null` for invalid paths.
-        let json = r#"{
-            "/nix/store/aaa-foo": {
-                "ca": null,
-                "closureSize": 200,
-                "deriver": "/nix/store/ddd-foo.drv",
-                "narHash": "sha256:abc",
-                "narSize": 100,
-                "references": ["/nix/store/bbb-bar"],
-                "registrationTime": 1776867243,
-                "signatures": [],
-                "ultimate": true
-            },
-            "/nix/store/zzz-invalid": null
-        }"#;
-        let v = parse(json);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].path, "/nix/store/aaa-foo");
-        assert_eq!(v[0].closure_size, 200);
-        assert!(v[0].valid);
-        assert_eq!(v[0].references, vec!["/nix/store/bbb-bar"]);
+    fn parses_ssh_url_with_user() {
+        let t = parse_ssh_target("ssh://user@example.com");
+        assert_eq!(t.host, "user@example.com");
+        assert_eq!(t.port, None);
+    }
+
+    #[test]
+    fn short_hostname_strips_trailing_newline() {
+        // What a `/proc/sys/kernel/hostname` read looks like.
+        assert_eq!(short_hostname("amaterasu\n"), Some("amaterasu"));
+    }
+
+    #[test]
+    fn short_hostname_drops_the_domain() {
+        assert_eq!(short_hostname("amaterasu.example.com\n"), Some("amaterasu"));
+    }
+
+    #[test]
+    fn short_hostname_rejects_empty() {
+        assert_eq!(short_hostname(""), None);
+        assert_eq!(short_hostname("  \n"), None);
     }
 }

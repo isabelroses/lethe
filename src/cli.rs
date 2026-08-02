@@ -1,15 +1,18 @@
-use anyhow::{Context, Result};
-use lix_diff::{PackageListDiff, color};
-use nu_ansi_term::{Color, Style as AnsiStyle};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow};
+use dix::store::StorePathInfo;
+use dix::{StorePath, StoreSnapshot};
 use rusqlite::{params, Connection, OptionalExtension};
+use size::Size;
 use tabled::settings::object::Columns;
 use tabled::settings::{Alignment, Modify, Style};
 use tabled::{Table, Tabled};
-use terminal_light::luma;
 use tracing::info;
+use yansi::Paint as _;
 
-use crate::diff::{self, ClosurePathRef};
-use crate::nix::{self, StorePathInfo, Target};
+use crate::nix::{self, Target};
 
 pub fn record(
     conn: &Connection,
@@ -28,38 +31,23 @@ pub fn record(
     info!("toplevel: {toplevel}");
 
     info!("fetching closure");
-    let closure = nix::fetch_closure(target, system_link)?;
-    info!("{} store paths", closure.len());
+    let snapshot = nix::fetch_snapshot(target, &toplevel)?;
+    info!("{} store paths, {} selected", snapshot.closure.len(), snapshot.selected.len());
 
-    let toplevel_size = closure
-        .iter()
-        .find(|p| p.path == toplevel)
-        .map(|p| p.closure_size)
-        .with_context(|| format!("toplevel {toplevel} not found in closure output"))?;
+    let toplevel_size: i64 = snapshot.closure.iter().map(|p| p.nar_size().bytes()).sum();
 
     let machine_id = upsert_machine(conn, &machine)?;
 
-    let last = conn
-        .query_row(
-            "SELECT id, toplevel FROM deployments
-             WHERE target_machine_id = ?1
-             ORDER BY id DESC LIMIT 1",
-            params![machine_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
+    if let Some(previous) = latest_deployment_for_machine(conn, machine_id)?
+        && previous.toplevel == toplevel
+    {
+        anyhow::bail!("machine {machine} already has this system as the most recent deployment");
+    }
 
-    if let Some((_id, prev_toplevel)) = &last
-        && prev_toplevel == &toplevel {
-            anyhow::bail!(
-                "machine {machine} already has this system as the most recent deployment"
-            );
-        }
-
-    insert_deployment(conn, machine_id, &toplevel, toplevel_size, &closure)?;
+    insert_deployment(conn, machine_id, &toplevel, toplevel_size, &snapshot)?;
     println!(
         "recorded deployment for {machine} (toplevel {toplevel}, closure {})",
-        format_size(toplevel_size)
+        Size::from_bytes(toplevel_size)
     );
     Ok(())
 }
@@ -125,7 +113,7 @@ pub fn deployments(conn: &Connection, machine: &str) -> Result<()> {
             Ok(DeploymentListRow {
                 id: row.get(0)?,
                 created: row.get(1)?,
-                size: format_size(row.get(2)?),
+                size: Size::from_bytes(row.get::<_, i64>(2)?).to_string(),
                 toplevel: row.get(3)?,
             })
         })?
@@ -178,7 +166,7 @@ pub fn show(conn: &Connection, id: i64) -> Result<()> {
     println!("  machine:   {machine}");
     println!("  created:   {created}");
     println!("  toplevel:  {top}");
-    println!("  size:      {} ({} bytes)", format_size(size), size);
+    println!("  size:      {} ({size} bytes)", Size::from_bytes(size));
 
     let n_paths: i64 = conn.query_row(
         "SELECT COUNT(*) FROM closures WHERE deployment_id = ?1",
@@ -192,47 +180,17 @@ pub fn show(conn: &Connection, id: i64) -> Result<()> {
 pub fn diff(conn: &Connection, old: &str, new: Option<&str>) -> Result<()> {
     let (old_dep, new_dep) = resolve_diff_pair(conn, old, new)?;
 
-    let new_paths = load_closure_paths(conn, new_dep.id)?;
-    let old_paths = load_closure_paths(conn, old_dep.id)?;
+    let old_snapshot = load_snapshot(conn, old_dep.id)?;
+    let new_snapshot = load_snapshot(conn, new_dep.id)?;
 
-    let new_refs: Vec<_> = new_paths
-        .iter()
-        .map(|(p, n)| ClosurePathRef { path: p, nar_size: *n })
-        .collect();
-    let old_refs: Vec<_> = old_paths
-        .iter()
-        .map(|(p, n)| ClosurePathRef { path: p, nar_size: *n })
-        .collect();
+    let report = dix::diff_store_snapshots(&old_snapshot, &new_snapshot);
 
-    let diff_root = diff::build_diff_root(&new_refs, &old_refs);
+    println!("{}", format!("<<< {}", old_dep.toplevel).bold().dim());
+    println!("{}", format!(">>> {}", new_dep.toplevel).bold().dim());
 
-    let mut packages = PackageListDiff::new();
-    packages.show_size_delta = false;
-    packages.from_diff_root(diff_root);
-
-    let before_text = format!("<<< {}", old_dep.toplevel);
-    let after_text = format!(">>> {}", new_dep.toplevel);
-    if color::color_enabled() {
-        let text_color = if luma().is_ok_and(|l| l > 0.6) {
-            Color::DarkGray
-        } else {
-            Color::LightGray
-        };
-        let arrow_style = AnsiStyle::new().bold().fg(text_color);
-        println!("{}", arrow_style.paint(&before_text));
-        println!("{}", arrow_style.paint(&after_text));
-    } else {
-        println!("{before_text}");
-        println!("{after_text}");
-    }
-    println!();
-    print!("{packages}");
-    println!(
-        "size: {} -> {} ({})",
-        format_size(old_dep.size),
-        format_size(new_dep.size),
-        packages.size_delta(),
-    );
+    let mut rendered = String::new();
+    dix::write_diff_report(&mut rendered, &report)?;
+    print!("{rendered}");
     Ok(())
 }
 
@@ -241,44 +199,46 @@ struct DeploymentRow {
     id: i64,
     target_machine_id: i64,
     toplevel: String,
-    size: i64,
-    #[allow(dead_code)]
-    created_at: String,
+}
+
+/// Column order here is what [`row_to_deployment`] indexes into, so the two
+/// are written next to each other and every query reuses this prefix.
+const SELECT_DEPLOYMENT: &str = "SELECT id, target_machine_id, toplevel FROM deployments";
+
+fn row_to_deployment(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
+    Ok(DeploymentRow {
+        id: r.get(0)?,
+        target_machine_id: r.get(1)?,
+        toplevel: r.get(2)?,
+    })
 }
 
 fn try_resolve_deployment(conn: &Connection, reference: &str) -> Result<Option<DeploymentRow>> {
     if let Ok(id) = reference.parse::<i64>() {
         return Ok(conn
             .query_row(
-                "SELECT id, target_machine_id, toplevel, size, created_at
-                 FROM deployments WHERE id = ?1",
+                &format!("{SELECT_DEPLOYMENT} WHERE id = ?1"),
                 params![id],
                 row_to_deployment,
             )
             .optional()?);
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT id, target_machine_id, toplevel, size, created_at
-         FROM deployments WHERE toplevel = ?1
-         ORDER BY id DESC",
-    )?;
-    let rows = stmt
+    let mut stmt =
+        conn.prepare(&format!("{SELECT_DEPLOYMENT} WHERE toplevel = ?1 ORDER BY id DESC"))?;
+    let mut rows = stmt
         .query_map(params![reference], row_to_deployment)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    match rows.len() {
-        0 => Ok(None),
-        1 => Ok(Some(rows.into_iter().next().unwrap())),
-        _ => {
-            let ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
-            anyhow::bail!(
-                "toplevel {reference} matches {} deployments (ids: {}); pass an id to disambiguate",
-                rows.len(),
-                ids.join(", "),
-            )
-        }
+    if rows.len() > 1 {
+        let ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
+        anyhow::bail!(
+            "toplevel {reference} matches {} deployments (ids: {}); pass an id to disambiguate",
+            rows.len(),
+            ids.join(", "),
+        );
     }
+    Ok(rows.pop())
 }
 
 fn resolve_deployment(conn: &Connection, reference: &str) -> Result<DeploymentRow> {
@@ -312,11 +272,9 @@ fn resolve_diff_pair(
             format!("no deployment, toplevel, or machine matches: {old}")
         })?;
 
-    let mut stmt = conn.prepare(
-        "SELECT id, target_machine_id, toplevel, size, created_at
-         FROM deployments WHERE target_machine_id = ?1
-         ORDER BY id DESC LIMIT 2",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "{SELECT_DEPLOYMENT} WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 2"
+    ))?;
     let mut rows = stmt
         .query_map(params![machine_id], row_to_deployment)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -327,8 +285,9 @@ fn resolve_diff_pair(
             rows.len()
         );
     }
-    let new_dep = rows.remove(0);
-    let old_dep = rows.remove(0);
+    // Newest first, so popping yields old then new.
+    let old_dep = rows.pop().expect("length checked above");
+    let new_dep = rows.pop().expect("length checked above");
     Ok((old_dep, new_dep))
 }
 
@@ -338,41 +297,40 @@ fn latest_deployment_for_machine(
 ) -> Result<Option<DeploymentRow>> {
     Ok(conn
         .query_row(
-            "SELECT id, target_machine_id, toplevel, size, created_at
-             FROM deployments
-             WHERE target_machine_id = ?1
-             ORDER BY id DESC LIMIT 1",
+            &format!("{SELECT_DEPLOYMENT} WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 1"),
             params![machine_id],
             row_to_deployment,
         )
         .optional()?)
 }
 
-fn row_to_deployment(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
-    Ok(DeploymentRow {
-        id: r.get(0)?,
-        target_machine_id: r.get(1)?,
-        toplevel: r.get(2)?,
-        size: r.get(3)?,
-        created_at: r.get(4)?,
-    })
-}
-
-fn load_closure_paths(conn: &Connection, deployment_id: i64) -> Result<Vec<(String, i64)>> {
+/// Load a recorded closure back into the same shape `dix` produces when
+/// querying a live store.
+fn load_snapshot(conn: &Connection, deployment_id: i64) -> Result<StoreSnapshot> {
     let mut stmt = conn.prepare(
-        "SELECT sp.path, sp.nar_size
+        "SELECT sp.path, sp.nar_size, c.selected
          FROM closures c
          JOIN store_paths sp ON sp.id = c.store_path_id
          WHERE c.deployment_id = ?1",
     )?;
     let rows = stmt.query_map(params![deployment_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?))
     })?;
-    let mut out = Vec::new();
+
+    let mut closure = Vec::new();
+    let mut selected = Vec::new();
     for row in rows {
-        out.push(row?);
+        let (path, nar_size, is_selected) = row?;
+        // `PathBuf::from(String)` reuses the buffer; passing a reference copies.
+        let store_path = StorePath::try_from(PathBuf::from(path))
+            .map_err(|e| anyhow!("invalid store path: {e}"))?;
+        if is_selected {
+            selected.push(store_path.clone());
+        }
+        closure.push(StorePathInfo::new(store_path, Size::from_bytes(nar_size)));
     }
-    Ok(out)
+
+    Ok(StoreSnapshot { closure, selected })
 }
 
 fn upsert_machine(conn: &Connection, identifier: &str) -> Result<i64> {
@@ -392,68 +350,36 @@ fn insert_deployment(
     machine_id: i64,
     toplevel: &str,
     size: i64,
-    closure: &[StorePathInfo],
+    snapshot: &StoreSnapshot,
 ) -> Result<i64> {
+    let selected: HashSet<&Path> = snapshot.selected.iter().map(|p| p.as_path()).collect();
+
     let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO deployments (target_machine_id, toplevel, size) VALUES (?1, ?2, ?3)",
+        params![machine_id, toplevel, size],
+    )?;
+    let deployment_id = tx.last_insert_rowid();
 
-    // Insert all store paths.
     {
-        let mut stmt = tx.prepare(
-            "INSERT OR IGNORE INTO store_paths
-                (path, closure_size, nar_size, deriver, nar_hash, valid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        // `DO UPDATE` rather than `DO NOTHING` so `RETURNING` still yields the
+        // id when the path is already known; the value written is unchanged.
+        let mut upsert = tx.prepare(
+            "INSERT INTO store_paths (path, nar_size) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET nar_size = excluded.nar_size
+             RETURNING id",
         )?;
-        for sp in closure {
-            stmt.execute(params![
-                sp.path,
-                sp.closure_size,
-                sp.nar_size,
-                sp.deriver,
-                sp.nar_hash,
-                i64::from(sp.valid)
-            ])?;
-        }
-    }
-
-    // Resolve store path IDs.
-    let mut id_for = std::collections::HashMap::<String, i64>::new();
-    {
-        let mut stmt = tx.prepare("SELECT id FROM store_paths WHERE path = ?1")?;
-        for sp in closure {
-            let id: i64 = stmt.query_row(params![sp.path], |r| r.get(0))?;
-            id_for.insert(sp.path.clone(), id);
-        }
-    }
-
-    let deployment_id = {
-        tx.execute(
-            "INSERT INTO deployments (target_machine_id, toplevel, size)
+        let mut link = tx.prepare(
+            "INSERT OR IGNORE INTO closures (store_path_id, deployment_id, selected)
              VALUES (?1, ?2, ?3)",
-            params![machine_id, toplevel, size],
         )?;
-        tx.last_insert_rowid()
-    };
 
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR IGNORE INTO closures (store_path_id, deployment_id) VALUES (?1, ?2)",
-        )?;
-        for sp in closure {
-            stmt.execute(params![id_for[&sp.path], deployment_id])?;
-        }
-    }
-
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR IGNORE INTO refs (referrer_id, referenced_id) VALUES (?1, ?2)",
-        )?;
-        for sp in closure {
-            let referrer = id_for[&sp.path];
-            for r in &sp.references {
-                if let Some(&referenced) = id_for.get(r) {
-                    stmt.execute(params![referrer, referenced])?;
-                }
-            }
+        for sp in &snapshot.closure {
+            let path = sp.path().to_str().context("non-UTF8 store path")?;
+            let store_path_id: i64 =
+                upsert.query_row(params![path, sp.nar_size().bytes()], |r| r.get(0))?;
+            let is_selected = selected.contains(sp.path().as_path());
+            link.execute(params![store_path_id, deployment_id, i64::from(is_selected)])?;
         }
     }
 
@@ -464,19 +390,7 @@ fn insert_deployment(
 fn target_label(target: &Target) -> String {
     match target {
         Target::Local => "local system".to_string(),
-        Target::Ssh(t) => match t.port {
-            Some(p) => format!("ssh://{}:{}", t.host, p),
-            None => format!("ssh://{}", t.host),
-        },
-    }
-}
-
-fn format_size(bytes: i64) -> String {
-    let s = humansize::format_size(bytes.unsigned_abs(), humansize::BINARY);
-    if bytes < 0 {
-        format!("-{s}")
-    } else {
-        s
+        Target::Ssh(t) => t.store_url(),
     }
 }
 
@@ -508,6 +422,61 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    fn add_closure_path(
+        conn: &Connection,
+        deployment_id: i64,
+        path: &str,
+        nar_size: i64,
+        selected: bool,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO store_paths (path, nar_size) VALUES (?1, ?2)",
+            params![path, nar_size],
+        )
+        .unwrap();
+        let store_path_id: i64 = conn
+            .query_row("SELECT id FROM store_paths WHERE path = ?1", params![path], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO closures (store_path_id, deployment_id, selected) VALUES (?1, ?2, ?3)",
+            params![store_path_id, deployment_id, i64::from(selected)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_snapshot_separates_selected_from_dependencies() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        let d = add_deployment(&conn, m, "/nix/store/aaa-system", 300);
+        let selected_path = "/nix/store/00000000000000000000000000000000-foo-1.0";
+        add_closure_path(&conn, d, selected_path, 100, true);
+        add_closure_path(
+            &conn,
+            d,
+            "/nix/store/00000000000000000000000000000001-bar-2.0",
+            200,
+            false,
+        );
+
+        let snapshot = load_snapshot(&conn, d).unwrap();
+
+        assert_eq!(snapshot.closure.len(), 2);
+        assert_eq!(snapshot.selected.len(), 1);
+        assert_eq!(snapshot.selected[0].to_str().unwrap(), selected_path);
+    }
+
+    #[test]
+    fn load_snapshot_rejects_paths_outside_the_nix_store() {
+        let conn = fresh_conn();
+        let m = add_machine(&conn, "host-a");
+        let d = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+        add_closure_path(&conn, d, "/etc/not-a-store-path", 100, false);
+
+        let err = load_snapshot(&conn, d).unwrap_err();
+        assert!(err.to_string().contains("invalid store path"));
     }
 
     #[test]

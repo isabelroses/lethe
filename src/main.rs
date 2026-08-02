@@ -1,6 +1,5 @@
 mod cli;
 mod db;
-mod diff;
 mod nix;
 
 use std::path::PathBuf;
@@ -112,7 +111,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    lix_diff::color::init(cli.no_color);
+    // `TTY_AND_COLOR` covers `NO_COLOR`, `CLICOLOR`/`CLICOLOR_FORCE`, and TTY
+    // detection; it is what the `detect-env`/`detect-tty` features are for.
+    if cli.no_color {
+        yansi::disable();
+    } else {
+        yansi::whenever(yansi::Condition::TTY_AND_COLOR);
+    }
 
     let conn = db::open(cli.db)?;
     match cli.command {
