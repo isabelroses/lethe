@@ -21,8 +21,14 @@ Record a remote machine over SSH:
 
 ```sh
 lethe record root@my-server
+lethe record ssh-ng://my-server:2222
 lethe record ssh://my-server:2222
 ```
+
+Bare hostnames use the `ssh-ng` Nix store protocol by default. Specify
+`ssh://` to use the legacy SSH store protocol instead. Explicit ports are used
+for both the SSH connection and the Nix store connection; existing `NIX_SSHOPTS`
+are preserved for the latter.
 
 By default `lethe` records `/run/current-system`. However, you can pass
 `--system-link` to record something else. For example, `/run/booted-system`, or a specific

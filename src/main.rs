@@ -28,7 +28,7 @@ struct Cli {
 enum Command {
     /// Record a new deployment for a machine
     Record {
-        /// SSH target: hostname, user@host, or ssh://[user@]host[:port].
+        /// SSH target: [user@]host or ssh[-ng]://[user@]host[:port] (defaults to ssh-ng).
         /// Omit when using --local.
         #[arg(required_unless_present = "local")]
         target: Option<String>,
@@ -120,20 +120,21 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     let conn = db::open(cli.db)?;
+    let out = &mut std::io::stdout().lock();
     match cli.command {
         Command::Record { target, local, name, system_link } => {
             let nix_target = if local {
                 nix::Target::Local
             } else {
                 let raw = target.expect("clap enforces this via required_unless_present");
-                nix::Target::Ssh(nix::parse_ssh_target(&raw))
+                nix::Target::Ssh(nix::parse_ssh_target(&raw)?)
             };
-            cli::record(&conn, name.as_deref(), &nix_target, &system_link)
+            cli::record(&conn, out, name.as_deref(), &nix_target, &system_link)
         }
-        Command::Machines => cli::machines(&conn),
-        Command::Deployments { machine } => cli::deployments(&conn, &machine),
-        Command::Show { id } => cli::show(&conn, id),
-        Command::Diff { old, new } => cli::diff(&conn, &old, new.as_deref()),
+        Command::Machines => cli::machines(&conn, out),
+        Command::Deployments { machine } => cli::deployments(&conn, out, &machine),
+        Command::Show { id } => cli::show(&conn, out, id),
+        Command::Diff { old, new } => cli::diff(&conn, out, &old, new.as_deref()),
         Command::Completions { .. } => unreachable!(),
     }
 }
