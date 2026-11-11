@@ -61,7 +61,7 @@ pub fn resolve_toplevel(target: &Target, link: &str) -> Result<String> {
         .to_str()
         .ok_or_else(|| anyhow!("path {link} contains invalid unicode"))?
         .to_string();
-    let store_path = StorePath::try_from(resolved.clone())
+    let store_path = StorePath::try_from(resolved)
         .map_err(|e| anyhow!("{link} did not resolve to a nix store path: {e}"))?;
     Ok(store_path.as_str().to_string())
 }
@@ -118,7 +118,7 @@ pub fn fetch_snapshot(target: &Target, toplevel: &str) -> Result<StoreSnapshot> 
 }
 
 /// Build a `StoreSnapshot` for a remote machine by running
-/// `nix path-info --json --recursive --store <url>` locally (Nix talks to
+/// `nix path-info --recursive --size --store <url>` locally (Nix talks to
 /// the remote store for us).
 fn fetch_remote_snapshot(t: &SshTarget, toplevel: &str) -> Result<StoreSnapshot> {
     let store_url = t.store_url();
@@ -139,19 +139,21 @@ fn fetch_remote_snapshot(t: &SshTarget, toplevel: &str) -> Result<StoreSnapshot>
         );
     }
 
-    let mut closure = Vec::new();
-    let mut selected = Vec::new();
-    for line in String::from_utf8(out.stdout)
-        .context("non-UTF8 nix path-info output")?
-        .lines()
-    {
-        let mut columns = line.split_whitespace();
-        let path_str = columns
-            .next()
-            .ok_or_else(|| anyhow!("missing path in nix path-info output line"))?;
-        let nar_size = columns
-            .next()
-            .ok_or_else(|| anyhow!("missing NAR size in nix path-info output line"))?
+    let stdout = String::from_utf8(out.stdout).context("non-UTF8 nix path-info output")?;
+    let estimated_lines = stdout.lines().count();
+    let mut closure = Vec::with_capacity(estimated_lines);
+    let mut selected = Vec::with_capacity(1);
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (path_str, nar_size_str) = trimmed
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| anyhow!("missing NAR size in nix path-info output line: {trimmed}"))?;
+        let nar_size = nar_size_str
+            .trim_start()
             .parse::<i64>()
             .context("failed to parse NAR size from nix path-info output")?;
         let store_path = StorePath::try_from(path_str.to_string())

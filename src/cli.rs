@@ -140,7 +140,8 @@ struct DeploymentListRow {
 pub fn show(conn: &Connection, id: i64) -> Result<()> {
     let row = conn
         .query_row(
-            "SELECT d.id, d.created_at, m.identifier, d.toplevel, d.size
+            "SELECT d.id, d.created_at, m.identifier, d.toplevel, d.size,
+                    (SELECT COUNT(*) FROM closures c WHERE c.deployment_id = d.id)
              FROM deployments d
              JOIN machines m ON m.id = d.target_machine_id
              WHERE d.id = ?1",
@@ -152,24 +153,19 @@ pub fn show(conn: &Connection, id: i64) -> Result<()> {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()?
         .with_context(|| format!("unknown deployment: {id}"))?;
 
-    let (id, created, machine, top, size) = row;
+    let (id, created, machine, top, size, n_paths) = row;
     println!("Deployment {id}");
     println!("  machine:   {machine}");
     println!("  created:   {created}");
     println!("  toplevel:  {top}");
     println!("  size:      {} ({size} bytes)", Size::from_bytes(size));
-
-    let n_paths: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM closures WHERE deployment_id = ?1",
-        params![id],
-        |r| r.get(0),
-    )?;
     println!("  closure:   {n_paths} store paths");
     Ok(())
 }
@@ -185,7 +181,7 @@ pub fn diff(conn: &Connection, old: &str, new: Option<&str>) -> Result<()> {
     println!("{}", format!("<<< {}", old_dep.toplevel).bold().dim());
     println!("{}", format!(">>> {}", new_dep.toplevel).bold().dim());
 
-    let mut rendered = String::new();
+    let mut rendered = String::with_capacity(4096);
     let _hidden = dix::write_diff_report(&mut rendered, &report, dix::RenderOptions::default())?;
     print!("{rendered}");
     Ok(())
@@ -198,10 +194,6 @@ struct DeploymentRow {
     toplevel: String,
 }
 
-/// Column order here is what [`row_to_deployment`] indexes into, so the two
-/// are written next to each other and every query reuses this prefix.
-const SELECT_DEPLOYMENT: &str = "SELECT id, target_machine_id, toplevel FROM deployments";
-
 fn row_to_deployment(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
     Ok(DeploymentRow {
         id: r.get(0)?,
@@ -213,16 +205,16 @@ fn row_to_deployment(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
 fn try_resolve_deployment(conn: &Connection, reference: &str) -> Result<Option<DeploymentRow>> {
     if let Ok(id) = reference.parse::<i64>() {
         return Ok(conn
-            .query_row(
-                &format!("{SELECT_DEPLOYMENT} WHERE id = ?1"),
-                params![id],
-                row_to_deployment,
-            )
+            .prepare_cached(
+                "SELECT id, target_machine_id, toplevel FROM deployments WHERE id = ?1",
+            )?
+            .query_row(params![id], row_to_deployment)
             .optional()?);
     }
 
-    let mut stmt =
-        conn.prepare(&format!("{SELECT_DEPLOYMENT} WHERE toplevel = ?1 ORDER BY id DESC"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, target_machine_id, toplevel FROM deployments WHERE toplevel = ?1 ORDER BY id DESC",
+    )?;
     let mut rows = stmt
         .query_map(params![reference], row_to_deployment)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -259,19 +251,16 @@ fn resolve_diff_pair(
     }
 
     let machine_id: i64 = conn
-        .query_row(
-            "SELECT id FROM machines WHERE identifier = ?1",
-            params![old],
-            |r| r.get(0),
-        )
+        .prepare_cached("SELECT id FROM machines WHERE identifier = ?1")?
+        .query_row(params![old], |r| r.get(0))
         .optional()?
         .with_context(|| {
             format!("no deployment, toplevel, or machine matches: {old}")
         })?;
 
-    let mut stmt = conn.prepare(&format!(
-        "{SELECT_DEPLOYMENT} WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 2"
-    ))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, target_machine_id, toplevel FROM deployments WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 2",
+    )?;
     let mut rows = stmt
         .query_map(params![machine_id], row_to_deployment)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -293,31 +282,30 @@ fn latest_deployment_for_machine(
     machine_id: i64,
 ) -> Result<Option<DeploymentRow>> {
     Ok(conn
-        .query_row(
-            &format!("{SELECT_DEPLOYMENT} WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 1"),
-            params![machine_id],
-            row_to_deployment,
-        )
+        .prepare_cached(
+            "SELECT id, target_machine_id, toplevel FROM deployments WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 1",
+        )?
+        .query_row(params![machine_id], row_to_deployment)
         .optional()?)
 }
 
 /// Load a recorded closure back into the same shape `dix` produces when
 /// querying a live store.
 fn load_snapshot(conn: &Connection, deployment_id: i64) -> Result<StoreSnapshot> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT sp.path, sp.nar_size, c.selected
          FROM closures c
          JOIN store_paths sp ON sp.id = c.store_path_id
          WHERE c.deployment_id = ?1",
     )?;
-    let rows = stmt.query_map(params![deployment_id], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?))
-    })?;
+    let mut rows = stmt.query(params![deployment_id])?;
 
-    let mut closure = Vec::new();
-    let mut selected = Vec::new();
-    for row in rows {
-        let (path, nar_size, is_selected) = row?;
+    let mut closure = Vec::with_capacity(1024);
+    let mut selected = Vec::with_capacity(1);
+    while let Some(r) = rows.next()? {
+        let path: String = r.get(0)?;
+        let nar_size: i64 = r.get(1)?;
+        let is_selected: bool = r.get(2)?;
         let store_path = StorePath::try_from(path)
             .map_err(|e| anyhow!("invalid store path: {e}"))?;
         if is_selected {
@@ -333,15 +321,13 @@ fn load_snapshot(conn: &Connection, deployment_id: i64) -> Result<StoreSnapshot>
 }
 
 fn upsert_machine(conn: &Connection, identifier: &str) -> Result<i64> {
-    conn.execute(
-        "INSERT OR IGNORE INTO machines (identifier) VALUES (?1)",
-        params![identifier],
-    )?;
-    Ok(conn.query_row(
-        "SELECT id FROM machines WHERE identifier = ?1",
-        params![identifier],
-        |r| r.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached(
+            "INSERT INTO machines (identifier) VALUES (?1)
+             ON CONFLICT(identifier) DO UPDATE SET id = id
+             RETURNING id",
+        )?
+        .query_row(params![identifier], |r| r.get(0))?)
 }
 
 fn insert_deployment(
@@ -351,8 +337,6 @@ fn insert_deployment(
     size: i64,
     snapshot: &StoreSnapshot,
 ) -> Result<i64> {
-    let selected: HashSet<&StorePath> = snapshot.selected.iter().collect();
-
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO deployments (target_machine_id, toplevel, size) VALUES (?1, ?2, ?3)",
@@ -360,27 +344,44 @@ fn insert_deployment(
     )?;
     let deployment_id = tx.last_insert_rowid();
 
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS staged_closure (
+             path TEXT NOT NULL,
+             nar_size INTEGER NOT NULL,
+             selected INTEGER NOT NULL
+         );",
+    )?;
+
     {
-        // `DO UPDATE` rather than `DO NOTHING` so `RETURNING` still yields the
-        // id when the path is already known; the value written is unchanged.
-        let mut upsert = tx.prepare(
-            "INSERT INTO store_paths (path, nar_size) VALUES (?1, ?2)
-             ON CONFLICT(path) DO UPDATE SET nar_size = excluded.nar_size
-             RETURNING id",
-        )?;
-        let mut link = tx.prepare(
-            "INSERT OR IGNORE INTO closures (store_path_id, deployment_id, selected)
-             VALUES (?1, ?2, ?3)",
+        let mut stage = tx.prepare_cached(
+            "INSERT INTO staged_closure (path, nar_size, selected) VALUES (?1, ?2, ?3)",
         )?;
 
+        let selected: HashSet<_> = snapshot.selected.iter().collect();
+
         for sp in &snapshot.closure {
-            let path = sp.path.to_str().context("non-UTF8 store path")?;
-            let store_path_id: i64 =
-                upsert.query_row(params![path, sp.nar_size.bytes()], |r| r.get(0))?;
             let is_selected = selected.contains(&sp.path);
-            link.execute(params![store_path_id, deployment_id, i64::from(is_selected)])?;
+            stage.execute(params![sp.path.as_str(), sp.nar_size.bytes(), i64::from(is_selected)])?;
         }
     }
+
+    // The WHERE clause disambiguates SELECT ... ON CONFLICT in SQLite.
+    tx.execute(
+        "INSERT INTO store_paths (path, nar_size)
+         SELECT path, nar_size FROM staged_closure WHERE true
+         ORDER BY rowid
+         ON CONFLICT(path) DO UPDATE SET nar_size = excluded.nar_size
+         WHERE store_paths.nar_size != excluded.nar_size",
+        [],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO closures (store_path_id, deployment_id, selected)
+         SELECT sp.id, ?1, sc.selected
+         FROM staged_closure sc
+         JOIN store_paths sp ON sp.path = sc.path",
+        params![deployment_id],
+    )?;
+    tx.execute("DELETE FROM staged_closure", [])?;
 
     tx.commit()?;
     Ok(deployment_id)
@@ -476,6 +477,148 @@ mod tests {
 
         let err = load_snapshot(&conn, d).unwrap_err();
         assert!(err.to_string().contains("invalid store path"));
+    }
+
+    #[test]
+    fn insert_deployment_and_show() {
+        let conn = fresh_conn();
+        let m = upsert_machine(&conn, "host-a").unwrap();
+        let sel = StorePath::try_from("/nix/store/00000000000000000000000000000000-sys".to_string()).unwrap();
+        let dep_path = StorePath::try_from("/nix/store/00000000000000000000000000000001-dep".to_string()).unwrap();
+        let snapshot = StoreSnapshot {
+            closure: vec![
+                StorePathInfo { path: sel.clone(), nar_size: Size::from_bytes(100) },
+                StorePathInfo { path: dep_path, nar_size: Size::from_bytes(200) },
+            ],
+            selected: vec![sel],
+        };
+        let d = insert_deployment(&conn, m, "/nix/store/00000000000000000000000000000000-sys", 300, &snapshot).unwrap();
+        let loaded = load_snapshot(&conn, d).unwrap();
+        assert_eq!(loaded.closure.len(), 2);
+        assert_eq!(loaded.selected.len(), 1);
+        assert!(show(&conn, d).is_ok());
+    }
+
+    #[test]
+    fn insert_deployment_updates_changed_sizes_and_reuses_existing_paths() {
+        let conn = fresh_conn();
+        let machine = upsert_machine(&conn, "host-a").unwrap();
+        let changed = StorePath::try_from(
+            "/nix/store/00000000000000000000000000000000-system".to_string(),
+        )
+        .unwrap();
+        let unchanged = StorePath::try_from(
+            "/nix/store/00000000000000000000000000000001-dependency".to_string(),
+        )
+        .unwrap();
+        let snapshot = |changed_size| StoreSnapshot {
+            closure: vec![
+                StorePathInfo {
+                    path: changed.clone(),
+                    nar_size: Size::from_bytes(changed_size),
+                },
+                StorePathInfo {
+                    path: unchanged.clone(),
+                    nar_size: Size::from_bytes(200),
+                },
+            ],
+            selected: vec![changed.clone()],
+        };
+        let first = insert_deployment(&conn, machine, changed.as_str(), 300, &snapshot(100))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE size_updates (path TEXT);
+             CREATE TEMP TRIGGER count_size_updates AFTER UPDATE ON store_paths
+             BEGIN INSERT INTO size_updates VALUES (NEW.path); END;",
+        )
+        .unwrap();
+
+        let second = insert_deployment(&conn, machine, changed.as_str(), 350, &snapshot(150))
+            .unwrap();
+
+        for id in [first, second] {
+            let loaded = load_snapshot(&conn, id).unwrap();
+            assert_eq!(loaded.closure.len(), 2);
+            assert_eq!(loaded.selected, vec![changed.clone()]);
+            assert_eq!(
+                loaded.closure.iter().find(|p| p.path == changed).unwrap().nar_size.bytes(),
+                150
+            );
+            assert_eq!(
+                loaded.closure.iter().find(|p| p.path == unchanged).unwrap().nar_size.bytes(),
+                200
+            );
+        }
+        let updated: Vec<String> = conn
+            .prepare("SELECT path FROM size_updates")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(updated, vec![changed.as_str()]);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM store_paths", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn insert_deployment_uses_last_size_for_duplicate_paths() {
+        let conn = fresh_conn();
+        let machine = upsert_machine(&conn, "host-a").unwrap();
+        let path = StorePath::try_from(
+            "/nix/store/00000000000000000000000000000000-system".to_string(),
+        )
+        .unwrap();
+        let snapshot = StoreSnapshot {
+            closure: vec![
+                StorePathInfo {
+                    path: path.clone(),
+                    nar_size: Size::from_bytes(100),
+                },
+                StorePathInfo {
+                    path: path.clone(),
+                    nar_size: Size::from_bytes(150),
+                },
+            ],
+            selected: vec![path.clone()],
+        };
+        let deployment = insert_deployment(&conn, machine, path.as_str(), 250, &snapshot).unwrap();
+        let loaded = load_snapshot(&conn, deployment).unwrap();
+        assert_eq!(loaded.closure.len(), 1);
+        assert_eq!(loaded.closure[0].nar_size.bytes(), 150);
+        assert_eq!(loaded.selected, vec![path]);
+    }
+
+    #[test]
+    fn insert_deployment_preserves_selected_paths() {
+        let conn = fresh_conn();
+        let machine = upsert_machine(&conn, "host-a").unwrap();
+        let paths: Vec<_> = (0..7)
+            .map(|i| StorePath::try_from(format!("/nix/store/{i:032}-package")).unwrap())
+            .collect();
+
+        for selected_count in [0, 1, 6] {
+            let snapshot = StoreSnapshot {
+                closure: paths
+                    .iter()
+                    .cloned()
+                    .map(|path| StorePathInfo {
+                        path,
+                        nar_size: Size::from_bytes(100),
+                    })
+                    .collect(),
+                selected: paths[..selected_count].to_vec(),
+            };
+            let id = insert_deployment(&conn, machine, paths[0].as_str(), 700, &snapshot).unwrap();
+            let loaded = load_snapshot(&conn, id).unwrap();
+            assert_eq!(loaded.closure.len(), paths.len());
+            assert_eq!(
+                loaded.selected.iter().collect::<HashSet<_>>(),
+                snapshot.selected.iter().collect()
+            );
+        }
     }
 
     #[test]

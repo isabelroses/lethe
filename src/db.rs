@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS deployments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_deployments_machine_toplevel ON deployments(target_machine_id, toplevel);
+CREATE INDEX IF NOT EXISTS idx_deployments_machine_id ON deployments(target_machine_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS closures (
     store_path_id INTEGER NOT NULL REFERENCES store_paths(id),
@@ -40,6 +41,8 @@ CREATE INDEX IF NOT EXISTS idx_closures_deployment
     ON closures(deployment_id, store_path_id, selected);
 ";
 
+const SCHEMA_VERSION: i32 = 1;
+
 pub fn open(override_path: Option<PathBuf>) -> Result<Connection> {
     let path = match override_path {
         Some(p) => p,
@@ -51,10 +54,30 @@ pub fn open(override_path: Option<PathBuf>) -> Result<Connection> {
     }
     let conn = Connection::open(&path)
         .with_context(|| format!("opening database at {}", path.display()))?;
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    conn.execute_batch(SCHEMA).context("initializing schema")?;
-    migrate(&conn).context("migrating schema")?;
+
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;
+         PRAGMA temp_store = MEMORY;
+         PRAGMA mmap_size = 268435456;
+         PRAGMA cache_size = -64000;",
+    )?;
+
+    ensure_schema(&conn)?;
     Ok(conn)
+}
+
+fn ensure_schema(conn: &Connection) -> Result<()> {
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    conn.execute_batch(SCHEMA).context("initializing schema")?;
+    migrate(conn).context("migrating schema")?;
+    conn.execute(&format!("PRAGMA user_version = {SCHEMA_VERSION}"), [])?;
+    Ok(())
 }
 
 /// Applies schema changes that `CREATE TABLE IF NOT EXISTS` can't express
