@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
-use dix::store::StoreBackend;
-use dix::{CommandBackend, StorePath, StoreSnapshot};
+use dix::{Store, StorePath, StoreSnapshot};
 use tracing::debug;
 
 pub enum Target {
@@ -44,8 +43,9 @@ pub fn parse_ssh_target(raw: &str) -> SshTarget {
 /// Resolve a system link (e.g. /run/current-system) to its store path.
 pub fn resolve_toplevel(target: &Target, link: &str) -> Result<String> {
     let resolved = match target {
-        Target::Local => std::fs::canonicalize(link)
-            .with_context(|| format!("resolving {link}"))?,
+        Target::Local => {
+            std::fs::canonicalize(link).with_context(|| format!("resolving {link}"))?
+        }
         Target::Ssh(_) => {
             let out = run(target, &["readlink", "-f", link])
                 .with_context(|| format!("resolving {link}"))?;
@@ -57,12 +57,13 @@ pub fn resolve_toplevel(target: &Target, link: &str) -> Result<String> {
         }
     };
 
-    let store_path = StorePath::try_from(resolved)
-        .map_err(|e| anyhow!("{link} did not resolve to a nix store path: {e}"))?;
-    store_path
+    let resolved = resolved
         .to_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("path {link} contains invalid unicode"))
+        .ok_or_else(|| anyhow!("path {link} contains invalid unicode"))?
+        .to_string();
+    let store_path = StorePath::try_from(resolved.clone())
+        .map_err(|e| anyhow!("{link} did not resolve to a nix store path: {e}"))?;
+    Ok(store_path.as_str().to_string())
 }
 
 const PROC_HOSTNAME: &str = "/proc/sys/kernel/hostname";
@@ -99,23 +100,76 @@ fn short_hostname(raw: &str) -> Option<&str> {
 pub fn fetch_snapshot(target: &Target, toplevel: &str) -> Result<StoreSnapshot> {
     let path = Path::new(toplevel);
     match target {
-        Target::Local => dix::query_store_snapshot(path, true)
-            .map_err(|e| anyhow!("querying local nix store: {e}")),
+        Target::Local => {
+            let store = Store::open();
+            let doc = store
+                .query_snapshot_document(path)
+                .map_err(|e| anyhow!("querying local nix store: {e}"))?;
+            Ok(doc.snapshot)
+        }
         Target::Ssh(t) => {
-            let mut backend = CommandBackend::default().store_url(t.store_url());
-            backend
-                .connect()
-                .map_err(|e| anyhow!("connecting to {}: {e}", t.host))?;
-            let snapshot = dix::query_store_snapshot_with_backend(&backend, path)
-                .map_err(|e| anyhow!("querying nix store on {}: {e}", t.host));
-            // Reported rather than propagated so a teardown failure can't mask
-            // the query error, which is the one worth seeing.
-            if let Err(e) = backend.close() {
-                debug!("closing connection to {}: {e}", t.host);
-            }
-            snapshot
+            // For remote stores we still need to use nix commands over SSH.
+            // query_snapshot_document only works on local paths, so we invoke
+            // nix path-info via the SSH target and parse the output into
+            // a snapshot ourselves.
+            fetch_remote_snapshot(t, toplevel)
         }
     }
+}
+
+/// Build a `StoreSnapshot` for a remote machine by running
+/// `nix path-info --json --recursive --store <url>` locally (Nix talks to
+/// the remote store for us).
+fn fetch_remote_snapshot(t: &SshTarget, toplevel: &str) -> Result<StoreSnapshot> {
+    let store_url = t.store_url();
+    let mut cmd = Command::new("nix");
+    cmd.args([
+        "path-info",
+        "--recursive",
+        "--size",
+        "--store",
+        &store_url,
+        toplevel,
+    ]);
+    let out = cmd.output().context("spawning nix path-info")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "nix path-info failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+
+    let mut closure = Vec::new();
+    let mut selected = Vec::new();
+    for line in String::from_utf8(out.stdout)
+        .context("non-UTF8 nix path-info output")?
+        .lines()
+    {
+        let mut columns = line.split_whitespace();
+        let path_str = columns
+            .next()
+            .ok_or_else(|| anyhow!("missing path in nix path-info output line"))?;
+        let nar_size = columns
+            .next()
+            .ok_or_else(|| anyhow!("missing NAR size in nix path-info output line"))?
+            .parse::<i64>()
+            .context("failed to parse NAR size from nix path-info output")?;
+        let store_path = StorePath::try_from(path_str.to_string())
+            .map_err(|e| anyhow!("invalid store path {path_str}: {e}"))?;
+        if path_str == toplevel {
+            selected.push(store_path.clone());
+        }
+        closure.push(dix::StorePathInfo {
+            path: store_path,
+            nar_size: dix::Size::from_bytes(nar_size),
+        });
+    }
+
+    if closure.is_empty() {
+        anyhow::bail!("nix path-info returned no store paths");
+    }
+
+    Ok(StoreSnapshot { closure, selected })
 }
 
 fn run(target: &Target, argv: &[&str]) -> Result<String> {
@@ -134,9 +188,7 @@ fn run(target: &Target, argv: &[&str]) -> Result<String> {
             c
         }
     };
-    let out = cmd
-        .output()
-        .with_context(|| format!("spawning {argv:?}"))?;
+    let out = cmd.output().with_context(|| format!("spawning {argv:?}"))?;
     if !out.status.success() {
         anyhow::bail!(
             "{} failed: {}",

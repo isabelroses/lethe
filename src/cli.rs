@@ -1,9 +1,6 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-
 use anyhow::{Context, Result, anyhow};
-use dix::store::StorePathInfo;
-use dix::{StorePath, StoreSnapshot};
+use dix::{StorePath, StorePathInfo, StoreSnapshot};
 use rusqlite::{params, Connection, OptionalExtension};
 use size::Size;
 use tabled::settings::object::Columns;
@@ -34,7 +31,7 @@ pub fn record(
     let snapshot = nix::fetch_snapshot(target, &toplevel)?;
     info!("{} store paths, {} selected", snapshot.closure.len(), snapshot.selected.len());
 
-    let toplevel_size: i64 = snapshot.closure.iter().map(|p| p.nar_size().bytes()).sum();
+    let toplevel_size: i64 = snapshot.closure.iter().map(|p| p.nar_size.bytes()).sum();
 
     let machine_id = upsert_machine(conn, &machine)?;
 
@@ -189,7 +186,7 @@ pub fn diff(conn: &Connection, old: &str, new: Option<&str>) -> Result<()> {
     println!("{}", format!(">>> {}", new_dep.toplevel).bold().dim());
 
     let mut rendered = String::new();
-    dix::write_diff_report(&mut rendered, &report)?;
+    let _hidden = dix::write_diff_report(&mut rendered, &report, dix::RenderOptions::default())?;
     print!("{rendered}");
     Ok(())
 }
@@ -321,13 +318,15 @@ fn load_snapshot(conn: &Connection, deployment_id: i64) -> Result<StoreSnapshot>
     let mut selected = Vec::new();
     for row in rows {
         let (path, nar_size, is_selected) = row?;
-        // `PathBuf::from(String)` reuses the buffer; passing a reference copies.
-        let store_path = StorePath::try_from(PathBuf::from(path))
+        let store_path = StorePath::try_from(path)
             .map_err(|e| anyhow!("invalid store path: {e}"))?;
         if is_selected {
             selected.push(store_path.clone());
         }
-        closure.push(StorePathInfo::new(store_path, Size::from_bytes(nar_size)));
+        closure.push(StorePathInfo {
+            path: store_path,
+            nar_size: Size::from_bytes(nar_size),
+        });
     }
 
     Ok(StoreSnapshot { closure, selected })
@@ -352,7 +351,7 @@ fn insert_deployment(
     size: i64,
     snapshot: &StoreSnapshot,
 ) -> Result<i64> {
-    let selected: HashSet<&Path> = snapshot.selected.iter().map(|p| p.as_path()).collect();
+    let selected: HashSet<&StorePath> = snapshot.selected.iter().collect();
 
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -375,10 +374,10 @@ fn insert_deployment(
         )?;
 
         for sp in &snapshot.closure {
-            let path = sp.path().to_str().context("non-UTF8 store path")?;
+            let path = sp.path.to_str().context("non-UTF8 store path")?;
             let store_path_id: i64 =
-                upsert.query_row(params![path, sp.nar_size().bytes()], |r| r.get(0))?;
-            let is_selected = selected.contains(sp.path().as_path());
+                upsert.query_row(params![path, sp.nar_size.bytes()], |r| r.get(0))?;
+            let is_selected = selected.contains(&sp.path);
             link.execute(params![store_path_id, deployment_id, i64::from(is_selected)])?;
         }
     }
