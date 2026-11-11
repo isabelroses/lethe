@@ -1,737 +1,196 @@
-use std::collections::HashSet;
-use anyhow::{Context, Result, anyhow};
-use dix::{StorePath, StorePathInfo, StoreSnapshot};
-use rusqlite::{params, Connection, OptionalExtension};
-use size::Size;
+use std::io::Write;
+
+use anyhow::Result;
+use dix::Size;
+use rusqlite::Connection;
+use tabled::builder::Builder;
 use tabled::settings::object::Columns;
 use tabled::settings::{Alignment, Modify, Style};
-use tabled::{Table, Tabled};
 use tracing::info;
 use yansi::Paint as _;
 
+use crate::db;
 use crate::nix::{self, Target};
 
 pub fn record(
     conn: &Connection,
+    out: &mut impl Write,
     name_override: Option<&str>,
     target: &Target,
     system_link: &str,
 ) -> Result<()> {
-    let machine = match name_override {
-        Some(n) => n.to_string(),
-        None => nix::fetch_hostname(target)?,
-    };
-    info!("recording {} ({})", machine, target_label(target));
+    info!("resolving {system_link} on {}", target.label());
+    let system = nix::identify(target, name_override, system_link)?;
+    info!("recording {}: {}", system.machine, system.toplevel);
 
-    info!("resolving {system_link}");
-    let toplevel = nix::resolve_toplevel(target, system_link)?;
-    info!("toplevel: {toplevel}");
+    // An early exit before the closure is fetched, which is the slow part.
+    // `db::record` enforces the same rule when it stores the deployment.
+    db::ensure_new(conn, &system.machine, &system.toplevel)?;
 
     info!("fetching closure");
-    let snapshot = nix::fetch_snapshot(target, &toplevel)?;
+    let snapshot = nix::fetch_snapshot(target, &system)?;
     info!("{} store paths, {} selected", snapshot.closure.len(), snapshot.selected.len());
 
-    let toplevel_size: i64 = snapshot.closure.iter().map(|p| p.nar_size.bytes()).sum();
+    let deployment = db::record(conn, &system.machine, &system.toplevel, &snapshot)?;
+    writeln!(
+        out,
+        "recorded deployment for {} (toplevel {}, closure {})",
+        deployment.machine,
+        deployment.toplevel,
+        Size::from_bytes(deployment.size)
+    )?;
+    Ok(())
+}
 
-    let machine_id = upsert_machine(conn, &machine)?;
+pub fn machines(conn: &Connection, out: &mut impl Write) -> Result<()> {
+    let rows = db::machines(conn)?.into_iter().map(|m| {
+        [m.identifier, m.deployments.to_string(), m.last_deployed.unwrap_or_else(|| "-".into())]
+    });
+    writeln!(out, "{}", table(["MACHINE", "DEPLOYS", "LAST"], rows, &[1]))?;
+    Ok(())
+}
 
-    if let Some(previous) = latest_deployment_for_machine(conn, machine_id)?
-        && previous.toplevel == toplevel
-    {
-        anyhow::bail!("machine {machine} already has this system as the most recent deployment");
-    }
+pub fn deployments(conn: &Connection, out: &mut impl Write, machine: &str) -> Result<()> {
+    let rows = db::deployments(conn, machine)?.into_iter().map(|d| {
+        [d.id.to_string(), d.created_at, Size::from_bytes(d.size).to_string(), d.toplevel]
+    });
+    writeln!(out, "{}", table(["ID", "CREATED", "SIZE", "TOPLEVEL"], rows, &[0, 2]))?;
+    Ok(())
+}
 
-    insert_deployment(conn, machine_id, &toplevel, toplevel_size, &snapshot)?;
-    println!(
-        "recorded deployment for {machine} (toplevel {toplevel}, closure {})",
-        Size::from_bytes(toplevel_size)
+pub fn show(conn: &Connection, out: &mut impl Write, id: i64) -> Result<()> {
+    let d = db::deployment(conn, id)?;
+    writeln!(out, "Deployment {}", d.id)?;
+    writeln!(out, "  machine:   {}", d.machine)?;
+    writeln!(out, "  created:   {}", d.created_at)?;
+    writeln!(out, "  toplevel:  {}", d.toplevel)?;
+    writeln!(out, "  size:      {} ({} bytes)", Size::from_bytes(d.size), d.size)?;
+    writeln!(out, "  closure:   {} store paths", db::closure_len(conn, id)?)?;
+    Ok(())
+}
+
+pub fn diff(conn: &Connection, out: &mut impl Write, old: &str, new: Option<&str>) -> Result<()> {
+    let (old_dep, new_dep) = db::resolve_diff_pair(conn, old, new)?;
+    let report = dix::diff_store_snapshots(
+        &db::load_snapshot(conn, old_dep.id)?,
+        &db::load_snapshot(conn, new_dep.id)?,
     );
-    Ok(())
-}
-
-pub fn machines(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT m.identifier,
-                COUNT(d.id) AS n,
-                MAX(d.created_at) AS last
-         FROM machines m
-         LEFT JOIN deployments d ON d.target_machine_id = m.id
-         GROUP BY m.id
-         ORDER BY m.identifier",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(MachineRow {
-                machine: row.get(0)?,
-                deploys: row.get(1)?,
-                last: row
-                    .get::<_, Option<String>>(2)?
-                    .unwrap_or_else(|| "-".to_string()),
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut table = Table::new(rows);
-    table
-        .with(Style::empty())
-        .with(Modify::new(Columns::one(1)).with(Alignment::right()));
-    println!("{table}");
-    Ok(())
-}
-
-#[derive(Tabled)]
-struct MachineRow {
-    #[tabled(rename = "MACHINE")]
-    machine: String,
-    #[tabled(rename = "DEPLOYS")]
-    deploys: i64,
-    #[tabled(rename = "LAST")]
-    last: String,
-}
-
-pub fn deployments(conn: &Connection, machine: &str) -> Result<()> {
-    let machine_id: i64 = conn
-        .query_row(
-            "SELECT id FROM machines WHERE identifier = ?1",
-            params![machine],
-            |r| r.get(0),
-        )
-        .optional()?
-        .with_context(|| format!("unknown machine: {machine}"))?;
-
-    let mut stmt = conn.prepare(
-        "SELECT id, created_at, size, toplevel
-         FROM deployments
-         WHERE target_machine_id = ?1
-         ORDER BY id DESC",
-    )?;
-    let rows = stmt
-        .query_map(params![machine_id], |row| {
-            Ok(DeploymentListRow {
-                id: row.get(0)?,
-                created: row.get(1)?,
-                size: Size::from_bytes(row.get::<_, i64>(2)?).to_string(),
-                toplevel: row.get(3)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let mut table = Table::new(rows);
-    table
-        .with(Style::empty())
-        .with(Modify::new(Columns::one(0)).with(Alignment::right()))
-        .with(Modify::new(Columns::one(2)).with(Alignment::right()));
-    println!("{table}");
-    Ok(())
-}
-
-#[derive(Tabled)]
-struct DeploymentListRow {
-    #[tabled(rename = "ID")]
-    id: i64,
-    #[tabled(rename = "CREATED")]
-    created: String,
-    #[tabled(rename = "SIZE")]
-    size: String,
-    #[tabled(rename = "TOPLEVEL")]
-    toplevel: String,
-}
-
-pub fn show(conn: &Connection, id: i64) -> Result<()> {
-    let row = conn
-        .query_row(
-            "SELECT d.id, d.created_at, m.identifier, d.toplevel, d.size,
-                    (SELECT COUNT(*) FROM closures c WHERE c.deployment_id = d.id)
-             FROM deployments d
-             JOIN machines m ON m.id = d.target_machine_id
-             WHERE d.id = ?1",
-            params![id],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                ))
-            },
-        )
-        .optional()?
-        .with_context(|| format!("unknown deployment: {id}"))?;
-
-    let (id, created, machine, top, size, n_paths) = row;
-    println!("Deployment {id}");
-    println!("  machine:   {machine}");
-    println!("  created:   {created}");
-    println!("  toplevel:  {top}");
-    println!("  size:      {} ({size} bytes)", Size::from_bytes(size));
-    println!("  closure:   {n_paths} store paths");
-    Ok(())
-}
-
-pub fn diff(conn: &Connection, old: &str, new: Option<&str>) -> Result<()> {
-    let (old_dep, new_dep) = resolve_diff_pair(conn, old, new)?;
-
-    let old_snapshot = load_snapshot(conn, old_dep.id)?;
-    let new_snapshot = load_snapshot(conn, new_dep.id)?;
-
-    let report = dix::diff_store_snapshots(&old_snapshot, &new_snapshot);
-
-    println!("{}", format!("<<< {}", old_dep.toplevel).bold().dim());
-    println!("{}", format!(">>> {}", new_dep.toplevel).bold().dim());
 
     let mut rendered = String::with_capacity(4096);
     let _hidden = dix::write_diff_report(&mut rendered, &report, dix::RenderOptions::default())?;
-    print!("{rendered}");
+    writeln!(out, "{}", format!("<<< {}", old_dep.toplevel).bold().dim())?;
+    writeln!(out, "{}", format!(">>> {}", new_dep.toplevel).bold().dim())?;
+    write!(out, "{rendered}")?;
     Ok(())
 }
 
-#[cfg_attr(test, derive(Debug))]
-struct DeploymentRow {
-    id: i64,
-    target_machine_id: i64,
-    toplevel: String,
-}
-
-fn row_to_deployment(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeploymentRow> {
-    Ok(DeploymentRow {
-        id: r.get(0)?,
-        target_machine_id: r.get(1)?,
-        toplevel: r.get(2)?,
-    })
-}
-
-fn try_resolve_deployment(conn: &Connection, reference: &str) -> Result<Option<DeploymentRow>> {
-    if let Ok(id) = reference.parse::<i64>() {
-        return Ok(conn
-            .prepare_cached(
-                "SELECT id, target_machine_id, toplevel FROM deployments WHERE id = ?1",
-            )?
-            .query_row(params![id], row_to_deployment)
-            .optional()?);
+fn table<const N: usize>(
+    header: [&str; N],
+    rows: impl IntoIterator<Item = [String; N]>,
+    right_aligned: &[usize],
+) -> String {
+    let mut builder = Builder::default();
+    builder.push_record(header);
+    for row in rows {
+        builder.push_record(row);
     }
-
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, target_machine_id, toplevel FROM deployments WHERE toplevel = ?1 ORDER BY id DESC",
-    )?;
-    let mut rows = stmt
-        .query_map(params![reference], row_to_deployment)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    if rows.len() > 1 {
-        let ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
-        anyhow::bail!(
-            "toplevel {reference} matches {} deployments (ids: {}); pass an id to disambiguate",
-            rows.len(),
-            ids.join(", "),
-        );
+    let mut table = builder.build();
+    table.with(Style::empty());
+    for &column in right_aligned {
+        table.with(Modify::new(Columns::one(column)).with(Alignment::right()));
     }
-    Ok(rows.pop())
-}
-
-fn resolve_deployment(conn: &Connection, reference: &str) -> Result<DeploymentRow> {
-    try_resolve_deployment(conn, reference)?
-        .with_context(|| format!("no deployment found with id or toplevel: {reference}"))
-}
-
-fn resolve_diff_pair(
-    conn: &Connection,
-    old: &str,
-    new: Option<&str>,
-) -> Result<(DeploymentRow, DeploymentRow)> {
-    if let Some(new) = new {
-        return Ok((resolve_deployment(conn, old)?, resolve_deployment(conn, new)?));
-    }
-
-    if let Some(old_dep) = try_resolve_deployment(conn, old)? {
-        let new_dep = latest_deployment_for_machine(conn, old_dep.target_machine_id)?
-            .with_context(|| format!("no deployments for machine id {}", old_dep.target_machine_id))?;
-        return Ok((old_dep, new_dep));
-    }
-
-    let machine_id: i64 = conn
-        .prepare_cached("SELECT id FROM machines WHERE identifier = ?1")?
-        .query_row(params![old], |r| r.get(0))
-        .optional()?
-        .with_context(|| {
-            format!("no deployment, toplevel, or machine matches: {old}")
-        })?;
-
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, target_machine_id, toplevel FROM deployments WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 2",
-    )?;
-    let mut rows = stmt
-        .query_map(params![machine_id], row_to_deployment)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    if rows.len() < 2 {
-        anyhow::bail!(
-            "machine {old} has fewer than two deployments ({})",
-            rows.len()
-        );
-    }
-    // Newest first, so popping yields old then new.
-    let old_dep = rows.pop().expect("length checked above");
-    let new_dep = rows.pop().expect("length checked above");
-    Ok((old_dep, new_dep))
-}
-
-fn latest_deployment_for_machine(
-    conn: &Connection,
-    machine_id: i64,
-) -> Result<Option<DeploymentRow>> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT id, target_machine_id, toplevel FROM deployments WHERE target_machine_id = ?1 ORDER BY id DESC LIMIT 1",
-        )?
-        .query_row(params![machine_id], row_to_deployment)
-        .optional()?)
-}
-
-/// Load a recorded closure back into the same shape `dix` produces when
-/// querying a live store.
-fn load_snapshot(conn: &Connection, deployment_id: i64) -> Result<StoreSnapshot> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT sp.path, sp.nar_size, c.selected
-         FROM closures c
-         JOIN store_paths sp ON sp.id = c.store_path_id
-         WHERE c.deployment_id = ?1",
-    )?;
-    let mut rows = stmt.query(params![deployment_id])?;
-
-    let mut closure = Vec::with_capacity(1024);
-    let mut selected = Vec::with_capacity(1);
-    while let Some(r) = rows.next()? {
-        let path: String = r.get(0)?;
-        let nar_size: i64 = r.get(1)?;
-        let is_selected: bool = r.get(2)?;
-        let store_path = StorePath::try_from(path)
-            .map_err(|e| anyhow!("invalid store path: {e}"))?;
-        if is_selected {
-            selected.push(store_path.clone());
-        }
-        closure.push(StorePathInfo {
-            path: store_path,
-            nar_size: Size::from_bytes(nar_size),
-        });
-    }
-
-    Ok(StoreSnapshot { closure, selected })
-}
-
-fn upsert_machine(conn: &Connection, identifier: &str) -> Result<i64> {
-    Ok(conn
-        .prepare_cached(
-            "INSERT INTO machines (identifier) VALUES (?1)
-             ON CONFLICT(identifier) DO UPDATE SET id = id
-             RETURNING id",
-        )?
-        .query_row(params![identifier], |r| r.get(0))?)
-}
-
-fn insert_deployment(
-    conn: &Connection,
-    machine_id: i64,
-    toplevel: &str,
-    size: i64,
-    snapshot: &StoreSnapshot,
-) -> Result<i64> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "INSERT INTO deployments (target_machine_id, toplevel, size) VALUES (?1, ?2, ?3)",
-        params![machine_id, toplevel, size],
-    )?;
-    let deployment_id = tx.last_insert_rowid();
-
-    tx.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS staged_closure (
-             path TEXT NOT NULL,
-             nar_size INTEGER NOT NULL,
-             selected INTEGER NOT NULL
-         );",
-    )?;
-
-    {
-        let mut stage = tx.prepare_cached(
-            "INSERT INTO staged_closure (path, nar_size, selected) VALUES (?1, ?2, ?3)",
-        )?;
-
-        let selected: HashSet<_> = snapshot.selected.iter().collect();
-
-        for sp in &snapshot.closure {
-            let is_selected = selected.contains(&sp.path);
-            stage.execute(params![sp.path.as_str(), sp.nar_size.bytes(), i64::from(is_selected)])?;
-        }
-    }
-
-    // The WHERE clause disambiguates SELECT ... ON CONFLICT in SQLite.
-    tx.execute(
-        "INSERT INTO store_paths (path, nar_size)
-         SELECT path, nar_size FROM staged_closure WHERE true
-         ORDER BY rowid
-         ON CONFLICT(path) DO UPDATE SET nar_size = excluded.nar_size
-         WHERE store_paths.nar_size != excluded.nar_size",
-        [],
-    )?;
-    tx.execute(
-        "INSERT OR IGNORE INTO closures (store_path_id, deployment_id, selected)
-         SELECT sp.id, ?1, sc.selected
-         FROM staged_closure sc
-         JOIN store_paths sp ON sp.path = sc.path",
-        params![deployment_id],
-    )?;
-    tx.execute("DELETE FROM staged_closure", [])?;
-
-    tx.commit()?;
-    Ok(deployment_id)
-}
-
-fn target_label(target: &Target) -> String {
-    match target {
-        Target::Local => "local system".to_string(),
-        Target::Ssh(t) => t.store_url(),
-    }
+    table.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
+    use crate::db::testing::{open_in_memory, path, snapshot};
 
-    fn fresh_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conn.execute_batch(db::SCHEMA).unwrap();
-        conn
-    }
-
-    fn add_machine(conn: &Connection, identifier: &str) -> i64 {
-        conn.execute(
-            "INSERT INTO machines (identifier) VALUES (?1)",
-            params![identifier],
-        )
-        .unwrap();
-        conn.last_insert_rowid()
-    }
-
-    fn add_deployment(conn: &Connection, machine_id: i64, toplevel: &str, size: i64) -> i64 {
-        conn.execute(
-            "INSERT INTO deployments (target_machine_id, toplevel, size) VALUES (?1, ?2, ?3)",
-            params![machine_id, toplevel, size],
-        )
-        .unwrap();
-        conn.last_insert_rowid()
-    }
-
-    fn add_closure_path(
-        conn: &Connection,
-        deployment_id: i64,
-        path: &str,
-        nar_size: i64,
-        selected: bool,
-    ) {
-        conn.execute(
-            "INSERT OR IGNORE INTO store_paths (path, nar_size) VALUES (?1, ?2)",
-            params![path, nar_size],
-        )
-        .unwrap();
-        let store_path_id: i64 = conn
-            .query_row("SELECT id FROM store_paths WHERE path = ?1", params![path], |r| r.get(0))
+    /// Two deployments of `host-a`: `foo` is upgraded and `bar` is added.
+    fn recorded() -> (Connection, String, String) {
+        let conn = open_in_memory();
+        let (old, new) = (path(0, "system-1"), path(1, "system-2"));
+        let (foo1, foo2, bar) = (path(2, "foo-1.0"), path(3, "foo-2.0"), path(4, "bar-1.0"));
+        db::record(&conn, "host-a", old.as_str(), &snapshot(&[(&old, 1024), (&foo1, 1024)], &[&foo1]))
             .unwrap();
-        conn.execute(
-            "INSERT INTO closures (store_path_id, deployment_id, selected) VALUES (?1, ?2, ?3)",
-            params![store_path_id, deployment_id, i64::from(selected)],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn load_snapshot_separates_selected_from_dependencies() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        let d = add_deployment(&conn, m, "/nix/store/aaa-system", 300);
-        let selected_path = "/nix/store/00000000000000000000000000000000-foo-1.0";
-        add_closure_path(&conn, d, selected_path, 100, true);
-        add_closure_path(
+        db::record(
             &conn,
-            d,
-            "/nix/store/00000000000000000000000000000001-bar-2.0",
-            200,
-            false,
+            "host-a",
+            new.as_str(),
+            &snapshot(&[(&new, 1024), (&foo2, 2048), (&bar, 1024)], &[&foo2, &bar]),
+        )
+        .unwrap();
+        conn.execute("UPDATE deployments SET created_at = '2026-01-0' || id || ' 12:00:00'", [])
+            .unwrap();
+        (conn, old.into(), new.into())
+    }
+
+    fn rendered(command: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> String {
+        let mut out = Vec::new();
+        command(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn trimmed_lines(text: &str) -> Vec<&str> {
+        text.lines().map(str::trim).collect()
+    }
+
+    #[test]
+    fn machines_lists_deploy_counts_and_last_deployment() {
+        let (conn, ..) = recorded();
+        conn.execute("INSERT INTO machines (identifier) VALUES ('host-b')", []).unwrap();
+        let out = rendered(|out| machines(&conn, out));
+        assert_eq!(
+            trimmed_lines(&out),
+            [
+                "MACHINE  DEPLOYS  LAST",
+                "host-a         2  2026-01-02 12:00:00",
+                "host-b         0  -",
+            ]
         );
-
-        let snapshot = load_snapshot(&conn, d).unwrap();
-
-        assert_eq!(snapshot.closure.len(), 2);
-        assert_eq!(snapshot.selected.len(), 1);
-        assert_eq!(snapshot.selected[0].to_str().unwrap(), selected_path);
     }
 
     #[test]
-    fn load_snapshot_rejects_paths_outside_the_nix_store() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        let d = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-        add_closure_path(&conn, d, "/etc/not-a-store-path", 100, false);
-
-        let err = load_snapshot(&conn, d).unwrap_err();
-        assert!(err.to_string().contains("invalid store path"));
+    fn deployments_lists_newest_first_with_sizes() {
+        let (conn, old, new) = recorded();
+        let out = rendered(|out| deployments(&conn, out, "host-a"));
+        assert_eq!(
+            trimmed_lines(&out),
+            [
+                "ID  CREATED                  SIZE  TOPLEVEL",
+                &format!("2  2026-01-02 12:00:00  4.00 KiB  {new}"),
+                &format!("1  2026-01-01 12:00:00  2.00 KiB  {old}"),
+            ]
+        );
+        assert!(deployments(&conn, &mut Vec::new(), "host-z").is_err());
     }
 
     #[test]
-    fn insert_deployment_and_show() {
-        let conn = fresh_conn();
-        let m = upsert_machine(&conn, "host-a").unwrap();
-        let sel = StorePath::try_from("/nix/store/00000000000000000000000000000000-sys".to_string()).unwrap();
-        let dep_path = StorePath::try_from("/nix/store/00000000000000000000000000000001-dep".to_string()).unwrap();
-        let snapshot = StoreSnapshot {
-            closure: vec![
-                StorePathInfo { path: sel.clone(), nar_size: Size::from_bytes(100) },
-                StorePathInfo { path: dep_path, nar_size: Size::from_bytes(200) },
-            ],
-            selected: vec![sel],
-        };
-        let d = insert_deployment(&conn, m, "/nix/store/00000000000000000000000000000000-sys", 300, &snapshot).unwrap();
-        let loaded = load_snapshot(&conn, d).unwrap();
-        assert_eq!(loaded.closure.len(), 2);
-        assert_eq!(loaded.selected.len(), 1);
-        assert!(show(&conn, d).is_ok());
+    fn show_prints_one_deployment() {
+        let (conn, _, new) = recorded();
+        let out = rendered(|out| show(&conn, out, 2));
+        assert_eq!(
+            out,
+            format!(
+                "Deployment 2\n  machine:   host-a\n  created:   2026-01-02 12:00:00\n  \
+                 toplevel:  {new}\n  size:      4.00 KiB (4096 bytes)\n  closure:   3 store paths\n"
+            )
+        );
+        let err = show(&conn, &mut Vec::new(), 9).unwrap_err();
+        assert!(err.to_string().contains("unknown deployment: 9"));
     }
 
     #[test]
-    fn insert_deployment_updates_changed_sizes_and_reuses_existing_paths() {
-        let conn = fresh_conn();
-        let machine = upsert_machine(&conn, "host-a").unwrap();
-        let changed = StorePath::try_from(
-            "/nix/store/00000000000000000000000000000000-system".to_string(),
-        )
-        .unwrap();
-        let unchanged = StorePath::try_from(
-            "/nix/store/00000000000000000000000000000001-dependency".to_string(),
-        )
-        .unwrap();
-        let snapshot = |changed_size| StoreSnapshot {
-            closure: vec![
-                StorePathInfo {
-                    path: changed.clone(),
-                    nar_size: Size::from_bytes(changed_size),
-                },
-                StorePathInfo {
-                    path: unchanged.clone(),
-                    nar_size: Size::from_bytes(200),
-                },
-            ],
-            selected: vec![changed.clone()],
-        };
-        let first = insert_deployment(&conn, machine, changed.as_str(), 300, &snapshot(100))
-            .unwrap();
-        conn.execute_batch(
-            "CREATE TEMP TABLE size_updates (path TEXT);
-             CREATE TEMP TRIGGER count_size_updates AFTER UPDATE ON store_paths
-             BEGIN INSERT INTO size_updates VALUES (NEW.path); END;",
-        )
-        .unwrap();
-
-        let second = insert_deployment(&conn, machine, changed.as_str(), 350, &snapshot(150))
-            .unwrap();
-
-        for id in [first, second] {
-            let loaded = load_snapshot(&conn, id).unwrap();
-            assert_eq!(loaded.closure.len(), 2);
-            assert_eq!(loaded.selected, vec![changed.clone()]);
-            assert_eq!(
-                loaded.closure.iter().find(|p| p.path == changed).unwrap().nar_size.bytes(),
-                150
-            );
-            assert_eq!(
-                loaded.closure.iter().find(|p| p.path == unchanged).unwrap().nar_size.bytes(),
-                200
-            );
+    fn diff_names_both_systems_and_the_changed_packages() {
+        let (conn, old, new) = recorded();
+        let out = rendered(|out| diff(&conn, out, "host-a", None));
+        let old_at = out.find(&format!("<<< {old}")).expect("old toplevel");
+        let new_at = out.find(&format!(">>> {new}")).expect("new toplevel");
+        assert!(old_at < new_at);
+        // Versions are coloured digit by digit, so only names are matched.
+        for needle in ["CHANGED", "foo", "ADDED", "bar"] {
+            assert!(out.contains(needle), "missing {needle} in:\n{out}");
         }
-        let updated: Vec<String> = conn
-            .prepare("SELECT path FROM size_updates")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(updated, vec![changed.as_str()]);
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM store_paths", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn insert_deployment_uses_last_size_for_duplicate_paths() {
-        let conn = fresh_conn();
-        let machine = upsert_machine(&conn, "host-a").unwrap();
-        let path = StorePath::try_from(
-            "/nix/store/00000000000000000000000000000000-system".to_string(),
-        )
-        .unwrap();
-        let snapshot = StoreSnapshot {
-            closure: vec![
-                StorePathInfo {
-                    path: path.clone(),
-                    nar_size: Size::from_bytes(100),
-                },
-                StorePathInfo {
-                    path: path.clone(),
-                    nar_size: Size::from_bytes(150),
-                },
-            ],
-            selected: vec![path.clone()],
-        };
-        let deployment = insert_deployment(&conn, machine, path.as_str(), 250, &snapshot).unwrap();
-        let loaded = load_snapshot(&conn, deployment).unwrap();
-        assert_eq!(loaded.closure.len(), 1);
-        assert_eq!(loaded.closure[0].nar_size.bytes(), 150);
-        assert_eq!(loaded.selected, vec![path]);
-    }
-
-    #[test]
-    fn insert_deployment_preserves_selected_paths() {
-        let conn = fresh_conn();
-        let machine = upsert_machine(&conn, "host-a").unwrap();
-        let paths: Vec<_> = (0..7)
-            .map(|i| StorePath::try_from(format!("/nix/store/{i:032}-package")).unwrap())
-            .collect();
-
-        for selected_count in [0, 1, 6] {
-            let snapshot = StoreSnapshot {
-                closure: paths
-                    .iter()
-                    .cloned()
-                    .map(|path| StorePathInfo {
-                        path,
-                        nar_size: Size::from_bytes(100),
-                    })
-                    .collect(),
-                selected: paths[..selected_count].to_vec(),
-            };
-            let id = insert_deployment(&conn, machine, paths[0].as_str(), 700, &snapshot).unwrap();
-            let loaded = load_snapshot(&conn, id).unwrap();
-            assert_eq!(loaded.closure.len(), paths.len());
-            assert_eq!(
-                loaded.selected.iter().collect::<HashSet<_>>(),
-                snapshot.selected.iter().collect()
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_by_id() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-
-        let dep = resolve_deployment(&conn, &d1.to_string()).unwrap();
-        assert_eq!(dep.id, d1);
-        assert_eq!(dep.toplevel, "/nix/store/aaa-system");
-    }
-
-    #[test]
-    fn resolve_by_toplevel() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-
-        let dep = resolve_deployment(&conn, "/nix/store/aaa-system").unwrap();
-        assert_eq!(dep.id, d1);
-    }
-
-    #[test]
-    fn resolve_unknown_ref_errors() {
-        let conn = fresh_conn();
-        add_machine(&conn, "host-a");
-
-        let err = resolve_deployment(&conn, "/nix/store/nope-system").unwrap_err();
-        assert!(err.to_string().contains("no deployment"));
-    }
-
-    #[test]
-    fn resolve_ambiguous_toplevel_errors() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        add_deployment(&conn, m, "/nix/store/dup-system", 100);
-        add_deployment(&conn, m, "/nix/store/dup-system", 200);
-
-        let err = resolve_deployment(&conn, "/nix/store/dup-system").unwrap_err();
-        assert!(err.to_string().contains("matches 2 deployments"));
-    }
-
-    #[test]
-    fn diff_pair_two_args_resolves_both() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-        let d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
-
-        let (old, new) =
-            resolve_diff_pair(&conn, &d1.to_string(), Some("/nix/store/bbb-system")).unwrap();
-        assert_eq!(old.id, d1);
-        assert_eq!(new.id, d2);
-    }
-
-    #[test]
-    fn diff_pair_single_id_uses_latest_for_machine() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-        let _d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
-        let d3 = add_deployment(&conn, m, "/nix/store/ccc-system", 300);
-
-        let (old, new) = resolve_diff_pair(&conn, &d1.to_string(), None).unwrap();
-        assert_eq!(old.id, d1);
-        assert_eq!(new.id, d3);
-    }
-
-    #[test]
-    fn diff_pair_machine_name_uses_last_two() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        let _d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-        let d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
-        let d3 = add_deployment(&conn, m, "/nix/store/ccc-system", 300);
-
-        let (old, new) = resolve_diff_pair(&conn, "host-a", None).unwrap();
-        assert_eq!(old.id, d2);
-        assert_eq!(new.id, d3);
-    }
-
-    #[test]
-    fn diff_pair_machine_with_one_deployment_errors() {
-        let conn = fresh_conn();
-        let m = add_machine(&conn, "host-a");
-        add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-
-        let err = resolve_diff_pair(&conn, "host-a", None).unwrap_err();
-        assert!(err.to_string().contains("fewer than two deployments"));
-    }
-
-    #[test]
-    fn diff_pair_unknown_single_ref_errors() {
-        let conn = fresh_conn();
-        add_machine(&conn, "host-a");
-
-        let err = resolve_diff_pair(&conn, "host-b", None).unwrap_err();
-        assert!(err.to_string().contains("no deployment, toplevel, or machine"));
-    }
-
-    #[test]
-    fn diff_pair_id_lookup_does_not_match_unrelated_machine() {
-        let conn = fresh_conn();
-        let m_a = add_machine(&conn, "host-a");
-        let m_b = add_machine(&conn, "host-b");
-        let d_a = add_deployment(&conn, m_a, "/nix/store/aaa-system", 100);
-        let _d_b1 = add_deployment(&conn, m_b, "/nix/store/bbb-system", 200);
-        let _d_b2 = add_deployment(&conn, m_b, "/nix/store/ccc-system", 300);
-
-        let (old, new) = resolve_diff_pair(&conn, &d_a.to_string(), None).unwrap();
-        assert_eq!(old.id, d_a);
-        assert_eq!(new.id, d_a);
-        assert_eq!(new.target_machine_id, m_a);
     }
 }
