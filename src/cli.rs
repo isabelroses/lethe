@@ -23,9 +23,15 @@ pub fn record(
     let system = nix::identify(target, name_override, system_link)?;
     info!("recording {}: {}", system.machine, system.toplevel);
 
-    // An early exit before the closure is fetched, which is the slow part.
-    // `db::record` enforces the same rule when it stores the deployment.
-    db::ensure_new(conn, &system.machine, &system.toplevel)?;
+    // Checked before the closure is fetched, which is the slow part.
+    if let Some(existing) = db::unchanged(conn, &system.machine, &system.toplevel)? {
+        writeln!(
+            out,
+            "already recorded as deployment {} for {}",
+            existing.number, existing.machine
+        )?;
+        return Ok(());
+    }
 
     info!("fetching closure");
     let snapshot = nix::fetch_snapshot(target, &system)?;
@@ -34,7 +40,8 @@ pub fn record(
     let deployment = db::record(conn, &system.machine, &system.toplevel, &snapshot)?;
     writeln!(
         out,
-        "recorded deployment for {} (toplevel {}, closure {})",
+        "recorded deployment {} for {} (toplevel {}, closure {})",
+        deployment.number,
         deployment.machine,
         deployment.toplevel,
         Size::from_bytes(deployment.size)
@@ -43,34 +50,54 @@ pub fn record(
 }
 
 pub fn machines(conn: &Connection, out: &mut impl Write) -> Result<()> {
-    let rows = db::machines(conn)?.into_iter().map(|m| {
+    let machines = db::machines(conn)?;
+    if machines.is_empty() {
+        writeln!(out, "nothing recorded yet; try `lethe record --local`")?;
+        return Ok(());
+    }
+    let rows = machines.into_iter().map(|m| {
         [m.identifier, m.deployments.to_string(), m.last_deployed.unwrap_or_else(|| "-".into())]
     });
-    writeln!(out, "{}", table(["MACHINE", "DEPLOYS", "LAST"], rows, &[1]))?;
+    writeln!(out, "{}", table(Some(["MACHINE", "DEPLOYS", "LAST"]), rows, &[1]))?;
     Ok(())
 }
 
 pub fn deployments(conn: &Connection, out: &mut impl Write, machine: &str) -> Result<()> {
     let rows = db::deployments(conn, machine)?.into_iter().map(|d| {
-        [d.id.to_string(), d.created_at, Size::from_bytes(d.size).to_string(), d.toplevel]
+        [d.number.to_string(), d.created_at, Size::from_bytes(d.size).to_string(), d.toplevel]
     });
-    writeln!(out, "{}", table(["ID", "CREATED", "SIZE", "TOPLEVEL"], rows, &[0, 2]))?;
+    writeln!(out, "{}", table(Some(["#", "CREATED", "SIZE", "TOPLEVEL"]), rows, &[0, 2]))?;
     Ok(())
 }
 
-pub fn show(conn: &Connection, out: &mut impl Write, id: i64) -> Result<()> {
-    let d = db::deployment(conn, id)?;
-    writeln!(out, "Deployment {}", d.id)?;
-    writeln!(out, "  machine:   {}", d.machine)?;
-    writeln!(out, "  created:   {}", d.created_at)?;
-    writeln!(out, "  toplevel:  {}", d.toplevel)?;
-    writeln!(out, "  size:      {} ({} bytes)", Size::from_bytes(d.size), d.size)?;
-    writeln!(out, "  closure:   {} store paths", db::closure_len(conn, id)?)?;
+pub fn show(
+    conn: &Connection,
+    out: &mut impl Write,
+    machine: &str,
+    reference: Option<&str>,
+) -> Result<()> {
+    let d = db::resolve(conn, machine, reference)?;
+    let closure = db::closure_len(conn, d.id)?;
+    let rows = [
+        ["machine", &d.machine],
+        ["deployment", &d.number.to_string()],
+        ["created", &d.created_at],
+        ["toplevel", &d.toplevel],
+        ["size", &format!("{} ({} bytes)", Size::from_bytes(d.size), d.size)],
+        ["closure", &format!("{closure} store paths")],
+    ];
+    writeln!(out, "{}", table(None, rows, &[]))?;
     Ok(())
 }
 
-pub fn diff(conn: &Connection, out: &mut impl Write, old: &str, new: Option<&str>) -> Result<()> {
-    let (old_dep, new_dep) = db::resolve_diff_pair(conn, old, new)?;
+pub fn diff(
+    conn: &Connection,
+    out: &mut impl Write,
+    machine: &str,
+    old: Option<&str>,
+    new: Option<&str>,
+) -> Result<()> {
+    let (old_dep, new_dep) = db::resolve_diff_pair(conn, machine, old, new)?;
     let report = dix::diff_store_snapshots(
         &db::load_snapshot(conn, old_dep.id)?,
         &db::load_snapshot(conn, new_dep.id)?,
@@ -78,19 +105,23 @@ pub fn diff(conn: &Connection, out: &mut impl Write, old: &str, new: Option<&str
 
     let mut rendered = String::with_capacity(4096);
     let _hidden = dix::write_diff_report(&mut rendered, &report, dix::RenderOptions::default())?;
-    writeln!(out, "{}", format!("<<< {}", old_dep.toplevel).bold().dim())?;
-    writeln!(out, "{}", format!(">>> {}", new_dep.toplevel).bold().dim())?;
+    for (marker, d) in [("<<<", &old_dep), (">>>", &new_dep)] {
+        let line = format!("{marker} {} {}  {}  {}", d.machine, d.number, d.created_at, d.toplevel);
+        writeln!(out, "{}", line.bold().dim())?;
+    }
     write!(out, "{rendered}")?;
     Ok(())
 }
 
 fn table<const N: usize>(
-    header: [&str; N],
-    rows: impl IntoIterator<Item = [String; N]>,
+    header: Option<[&str; N]>,
+    rows: impl IntoIterator<Item = [impl Into<String>; N]>,
     right_aligned: &[usize],
 ) -> String {
     let mut builder = Builder::default();
-    builder.push_record(header);
+    if let Some(header) = header {
+        builder.push_record(header);
+    }
     for row in rows {
         builder.push_record(row);
     }
@@ -121,8 +152,14 @@ mod tests {
             &snapshot(&[(&new, 1024), (&foo2, 2048), (&bar, 1024)], &[&foo2, &bar]),
         )
         .unwrap();
-        conn.execute("UPDATE deployments SET created_at = '2026-01-0' || id || ' 12:00:00'", [])
-            .unwrap();
+        // Stored in UTC and shown in local time; written so that the local
+        // time reads the same whatever zone the tests run in.
+        conn.execute(
+            "UPDATE deployments
+             SET created_at = datetime('2026-01-0' || id || ' 12:00:00', 'utc')",
+            [],
+        )
+        .unwrap();
         (conn, old.into(), new.into())
     }
 
@@ -134,6 +171,12 @@ mod tests {
 
     fn trimmed_lines(text: &str) -> Vec<&str> {
         text.lines().map(str::trim).collect()
+    }
+
+    #[test]
+    fn machines_says_so_when_nothing_is_recorded() {
+        let out = rendered(|out| machines(&open_in_memory(), out));
+        assert_eq!(out, "nothing recorded yet; try `lethe record --local`\n");
     }
 
     #[test]
@@ -158,7 +201,7 @@ mod tests {
         assert_eq!(
             trimmed_lines(&out),
             [
-                "ID  CREATED                  SIZE  TOPLEVEL",
+                "#  CREATED                  SIZE  TOPLEVEL",
                 &format!("2  2026-01-02 12:00:00  4.00 KiB  {new}"),
                 &format!("1  2026-01-01 12:00:00  2.00 KiB  {old}"),
             ]
@@ -167,26 +210,33 @@ mod tests {
     }
 
     #[test]
-    fn show_prints_one_deployment() {
-        let (conn, _, new) = recorded();
-        let out = rendered(|out| show(&conn, out, 2));
+    fn show_prints_one_deployment_of_a_machine() {
+        let (conn, old, new) = recorded();
+        let out = rendered(|out| show(&conn, out, "host-a", None));
+        assert_eq!(out, rendered(|out| show(&conn, out, "host-a", Some("2"))));
         assert_eq!(
-            out,
-            format!(
-                "Deployment 2\n  machine:   host-a\n  created:   2026-01-02 12:00:00\n  \
-                 toplevel:  {new}\n  size:      4.00 KiB (4096 bytes)\n  closure:   3 store paths\n"
-            )
+            trimmed_lines(&out),
+            [
+                "machine     host-a",
+                "deployment  2",
+                "created     2026-01-02 12:00:00",
+                &format!("toplevel    {new}"),
+                "size        4.00 KiB (4096 bytes)",
+                "closure     3 store paths",
+            ]
         );
-        let err = show(&conn, &mut Vec::new(), 9).unwrap_err();
-        assert!(err.to_string().contains("unknown deployment: 9"));
+        let first = rendered(|out| show(&conn, out, "host-a", Some("1")));
+        assert!(first.contains(&old), "{first}");
+        let err = show(&conn, &mut Vec::new(), "host-a", Some("9")).unwrap_err();
+        assert_eq!(err.to_string(), "machine host-a has no deployment 9 (the latest is 2)");
     }
 
     #[test]
     fn diff_names_both_systems_and_the_changed_packages() {
         let (conn, old, new) = recorded();
-        let out = rendered(|out| diff(&conn, out, "host-a", None));
-        let old_at = out.find(&format!("<<< {old}")).expect("old toplevel");
-        let new_at = out.find(&format!(">>> {new}")).expect("new toplevel");
+        let out = rendered(|out| diff(&conn, out, "host-a", None, None));
+        let old_at = out.find(&format!("<<< host-a 1  2026-01-01 12:00:00  {old}")).expect("old");
+        let new_at = out.find(&format!(">>> host-a 2  2026-01-02 12:00:00  {new}")).expect("new");
         assert!(old_at < new_at);
         // Versions are coloured digit by digit, so only names are matched.
         for needle in ["CHANGED", "foo", "ADDED", "bar"] {

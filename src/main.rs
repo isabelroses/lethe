@@ -12,12 +12,16 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "lethe", version, about = "Record and inspect NixOS deployments")]
 struct Cli {
-    /// Path to the `SQLite` database (defaults to $`XDG_DATA_HOME/lethe/lethe.db`)
-    #[arg(long, global = true, env = "LETHE_DB")]
+    #[arg(
+        long,
+        global = true,
+        env = "LETHE_DB",
+        value_name = "PATH",
+        help = "Path to the SQLite database [default: $XDG_DATA_HOME/lethe/lethe.db]"
+    )]
     db: Option<PathBuf>,
 
-    /// Disable colored output (also respects `NO_COLOR` env var and CI environments)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Disable colored output (NO_COLOR is also respected)")]
     no_color: bool,
 
     #[command(subcommand)]
@@ -28,8 +32,8 @@ struct Cli {
 enum Command {
     /// Record a new deployment for a machine
     Record {
-        /// SSH target: [user@]host or ssh[-ng]://[user@]host[:port] (defaults to ssh-ng).
-        /// Omit when using --local.
+        /// SSH target: [user@]host[:port] or ssh[-ng]://[user@]host[:port].
+        /// Uses ssh-ng unless ssh:// is given. Omit when using --local.
         #[arg(required_unless_present = "local")]
         target: Option<String>,
 
@@ -37,14 +41,13 @@ enum Command {
         #[arg(long, conflicts_with = "target")]
         local: bool,
 
-        /// Override the stored machine identifier (defaults to `hostname -s` on the target)
+        /// Machine identifier to record under [default: the target's short hostname]
         #[arg(long)]
         name: Option<String>,
 
-        /// Path to the system to record (defaults to /run/current-system).
-        /// Accepts any nix path-info argument: /run/booted-system,
-        /// /nix/var/nix/profiles/system-192-link, a /nix/store path, etc.
-        #[arg(long, default_value = "/run/current-system")]
+        /// System to record: any path that resolves into the store, such as
+        /// /run/booted-system or /nix/var/nix/profiles/system-192-link
+        #[arg(long, value_name = "PATH", default_value = "/run/current-system")]
         system_link: String,
     },
 
@@ -57,20 +60,24 @@ enum Command {
         machine: String,
     },
 
-    /// Show a single deployment
+    /// Show one deployment of a machine
     Show {
-        /// Deployment id
-        id: i64,
+        /// Machine identifier
+        machine: String,
+
+        /// Deployment number or toplevel /nix/store path [default: the latest]
+        deployment: Option<String>,
     },
 
-    /// Diff two deployments
+    /// Diff two deployments of a machine
     Diff {
-        /// Deployment id, toplevel /nix/store path, or machine identifier.
-        /// When a machine is given (and `new` is omitted), the last two
-        /// deployments for that machine are diffed.
-        old: String,
+        /// Machine identifier. On its own, diffs its last two deployments
+        machine: String,
 
-        /// New deployment (id or toplevel; defaults to the latest deployment of the same machine)
+        /// Deployment number or toplevel /nix/store path to start from
+        old: Option<String>,
+
+        /// Deployment number or toplevel /nix/store path [default: the latest]
         new: Option<String>,
     },
 
@@ -95,7 +102,8 @@ fn main() -> ExitCode {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        // dix logs a summary of every diff at info, which repeats the report.
+        .unwrap_or_else(|_| EnvFilter::new("info,dix=warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -133,8 +141,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Machines => cli::machines(&conn, out),
         Command::Deployments { machine } => cli::deployments(&conn, out, &machine),
-        Command::Show { id } => cli::show(&conn, out, id),
-        Command::Diff { old, new } => cli::diff(&conn, out, &old, new.as_deref()),
+        Command::Show { machine, deployment } => {
+            cli::show(&conn, out, &machine, deployment.as_deref())
+        }
+        Command::Diff { machine, old, new } => {
+            cli::diff(&conn, out, &machine, old.as_deref(), new.as_deref())
+        }
         Command::Completions { .. } => unreachable!(),
     }
 }

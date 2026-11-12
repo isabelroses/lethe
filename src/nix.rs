@@ -235,7 +235,9 @@ fn parse_path_info(stdout: &str) -> Result<Vec<StorePathInfo>> {
 }
 
 fn output_of(cmd: &mut Command, what: &str) -> Result<String> {
-    let out = cmd.output().with_context(|| format!("spawning {what}"))?;
+    let out = cmd
+        .output()
+        .with_context(|| format!("could not run {}", cmd.get_program().to_string_lossy()))?;
     if !out.status.success() {
         bail!("{what} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }

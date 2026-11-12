@@ -83,52 +83,61 @@ fn records_remote_targets_with_the_requested_store_and_port() {
         let ssh_log = dir.join(format!("ssh-{index}"));
         let nix_log = dir.join(format!("nix-{index}"));
         let options_log = dir.join(format!("options-{index}"));
-        let result = Command::new(env!("CARGO_BIN_EXE_lethe"))
-            .args([
-                "--db",
-                dir.join(format!("db-{index}")).to_str().unwrap(),
-                "record",
-                target,
-            ])
-            .env("PATH", &path)
-            .env("SSH_LOG", &ssh_log)
-            .env("NIX_LOG", &nix_log)
-            .env("OPTIONS_LOG", &options_log)
-            .env("NIX_SSHOPTS", "-o BatchMode=yes")
-            .env("RUST_LOG", "off")
-            .output()
-            .unwrap();
+        let record = || {
+            Command::new(env!("CARGO_BIN_EXE_lethe"))
+                .args(["--db", dir.join(format!("db-{index}")).to_str().unwrap(), "record", target])
+                .env("PATH", &path)
+                .env("SSH_LOG", &ssh_log)
+                .env("NIX_LOG", &nix_log)
+                .env("OPTIONS_LOG", &options_log)
+                .env("NIX_SSHOPTS", "-o BatchMode=yes")
+                .env("RUST_LOG", "off")
+                .output()
+                .unwrap()
+        };
+        let result = record();
         assert!(
             result.status.success(),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
         assert_eq!(
-            fs::read_to_string(ssh_log).unwrap(),
+            fs::read_to_string(&ssh_log).unwrap(),
             format!(
                 "{expected_ssh} test ! -e /run/current-system/sw || nix-store --query --references \
                  /run/current-system/sw && readlink -f /run/current-system && hostname -s\n"
             )
         );
         assert!(
-            String::from_utf8_lossy(&result.stdout).starts_with("recorded deployment for test-host "),
+            String::from_utf8_lossy(&result.stdout).starts_with("recorded deployment 1 for test-host "),
             "{}",
             String::from_utf8_lossy(&result.stdout)
         );
         assert_eq!(
-            fs::read_to_string(nix_log).unwrap(),
+            fs::read_to_string(&nix_log).unwrap(),
             format!(
                 "path-info --recursive --size --store {expected_store} /nix/store/00000000000000000000000000000000-system\n"
             )
         );
         assert_eq!(
-            fs::read_to_string(options_log).unwrap().trim(),
+            fs::read_to_string(&options_log).unwrap().trim(),
             expected_options
         );
 
         // The selected set is what the target reported, not the toplevel.
         let selected = selected_paths(&dir.join(format!("db-{index}")));
         assert_eq!(selected, ["/nix/store/00000000000000000000000000000001-package"]);
+
+        // Recording the same system again is a no-op that still succeeds,
+        // and it stops before the closure is fetched.
+        fs::remove_file(&nix_log).unwrap();
+        let again = record();
+        assert!(again.status.success(), "{}", String::from_utf8_lossy(&again.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&again.stdout),
+            "already recorded as deployment 1 for test-host\n"
+        );
+        assert!(!nix_log.exists(), "the closure was fetched again");
     }
 
     fs::remove_dir_all(dir).unwrap();

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dix::{Size, StorePath, StorePathInfo, StoreSnapshot};
 use rusqlite::{Connection, OptionalExtension, params};
 
-const SCHEMA: &str = r"
+const TABLES: &str = r"
 -- `UNIQUE` already indexes the column, so no explicit index is declared for
 -- `machines.identifier` or `store_paths.path`.
 CREATE TABLE IF NOT EXISTS machines (
@@ -22,16 +22,16 @@ CREATE TABLE IF NOT EXISTS store_paths (
     nar_size INTEGER NOT NULL
 );
 
+-- `id` is the key closures point at. `number` counts the deployments of one
+-- machine from 1 and is the name users see.
 CREATE TABLE IF NOT EXISTS deployments (
     id INTEGER PRIMARY KEY,
     target_machine_id INTEGER NOT NULL REFERENCES machines(id),
+    number INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     toplevel TEXT NOT NULL,
     size INTEGER NOT NULL DEFAULT 0
 );
-
-CREATE INDEX IF NOT EXISTS idx_deployments_machine_toplevel ON deployments(target_machine_id, toplevel);
-CREATE INDEX IF NOT EXISTS idx_deployments_machine_id ON deployments(target_machine_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS closures (
     store_path_id INTEGER NOT NULL REFERENCES store_paths(id),
@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS closures (
     selected INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (store_path_id, deployment_id)
 );
+";
+
+/// Created after `migrate`, which adds the columns they cover to databases
+/// that predate them.
+const INDEXES: &str = r"
+CREATE INDEX IF NOT EXISTS idx_deployments_machine_toplevel ON deployments(target_machine_id, toplevel);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_machine_number ON deployments(target_machine_id, number);
 
 -- Reads filter on `deployment_id`, which the primary key sorts second and so
 -- cannot serve. The trailing columns make this index covering.
@@ -46,7 +53,7 @@ CREATE INDEX IF NOT EXISTS idx_closures_deployment
     ON closures(deployment_id, store_path_id, selected);
 ";
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub fn open(override_path: Option<PathBuf>) -> Result<Connection> {
     let path = match override_path {
@@ -79,9 +86,13 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    conn.execute_batch(SCHEMA).context("initializing schema")?;
-    migrate(conn).context("migrating schema")?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    // One transaction, so an interrupted upgrade leaves the old schema intact.
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(TABLES).context("initializing schema")?;
+    migrate(&tx).context("migrating schema")?;
+    tx.execute_batch(INDEXES).context("creating indexes")?;
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -93,12 +104,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE closures ADD COLUMN selected INTEGER NOT NULL DEFAULT 0", [])?;
     }
 
+    if !has_column(conn, "deployments", "number")? {
+        conn.execute_batch(
+            "ALTER TABLE deployments ADD COLUMN number INTEGER NOT NULL DEFAULT 0;
+             UPDATE deployments SET number = (
+                 SELECT COUNT(*) FROM deployments earlier
+                 WHERE earlier.target_machine_id = deployments.target_machine_id
+                   AND earlier.id <= deployments.id
+             );",
+        )?;
+    }
+
     conn.execute_batch(
         "DROP TABLE IF EXISTS refs;
          DROP INDEX IF EXISTS idx_store_paths_deriver;
          DROP INDEX IF EXISTS idx_store_paths_nar_hash;
          DROP INDEX IF EXISTS idx_deployments_toplevel;
          DROP INDEX IF EXISTS idx_deployments_machine;
+         DROP INDEX IF EXISTS idx_deployments_machine_id;
          DROP INDEX IF EXISTS idx_store_paths_path;
          DROP INDEX IF EXISTS idx_machines_identifier;",
     )?;
@@ -161,9 +184,12 @@ pub struct Machine {
 
 #[derive(Debug)]
 pub struct Deployment {
+    /// Internal key; users see `number`.
     pub id: i64,
-    pub machine_id: i64,
+    /// Position among the deployments of its machine, counted from 1.
+    pub number: i64,
     pub machine: String,
+    /// In the local time zone.
     pub created_at: String,
     pub toplevel: String,
     /// Sum of the NAR sizes of the closure, in bytes.
@@ -172,7 +198,7 @@ pub struct Deployment {
 
 pub fn machines(conn: &Connection) -> Result<Vec<Machine>> {
     let mut stmt = conn.prepare(
-        "SELECT m.identifier, COUNT(d.id), MAX(d.created_at)
+        "SELECT m.identifier, COUNT(d.id), datetime(MAX(d.created_at), 'localtime')
          FROM machines m
          LEFT JOIN deployments d ON d.target_machine_id = m.id
          GROUP BY m.id
@@ -188,14 +214,18 @@ pub fn machines(conn: &Connection) -> Result<Vec<Machine>> {
 
 /// The deployments of a machine, newest first.
 pub fn deployments(conn: &Connection, machine: &str) -> Result<Vec<Deployment>> {
-    find_machine(conn, machine)?.with_context(|| format!("unknown machine: {machine}"))?;
-    find_deployments(conn, "m.identifier = ?1 ORDER BY d.id DESC", machine)
+    let machine_id = require_machine(conn, machine)?;
+    find_deployments(conn, "d.target_machine_id = ?1 ORDER BY d.number DESC", [machine_id])
 }
 
-pub fn deployment(conn: &Connection, id: i64) -> Result<Deployment> {
-    find_deployments(conn, "d.id = ?1", id)?
-        .pop()
-        .with_context(|| format!("unknown deployment: {id}"))
+/// One deployment of `machine`, by number or toplevel; the latest when no
+/// reference is given.
+pub fn resolve(conn: &Connection, machine: &str, reference: Option<&str>) -> Result<Deployment> {
+    let machine_id = require_machine(conn, machine)?;
+    match reference {
+        Some(reference) => resolve_in(conn, machine_id, machine, reference),
+        None => require_latest(conn, machine_id, machine),
+    }
 }
 
 pub fn closure_len(conn: &Connection, deployment_id: i64) -> Result<i64> {
@@ -206,17 +236,18 @@ pub fn closure_len(conn: &Connection, deployment_id: i64) -> Result<i64> {
     )?)
 }
 
-/// Fail if `toplevel` is already the most recent deployment of `machine`.
-pub fn ensure_new(conn: &Connection, machine: &str, toplevel: &str) -> Result<()> {
-    let latest = find_deployments(conn, "m.identifier = ?1 ORDER BY d.id DESC LIMIT 1", machine)?;
-    if latest.first().is_some_and(|d| d.toplevel == toplevel) {
-        bail!("machine {machine} already has this system as the most recent deployment");
-    }
-    Ok(())
+/// The latest deployment of `machine`, if it is already `toplevel`.
+pub fn unchanged(conn: &Connection, machine: &str, toplevel: &str) -> Result<Option<Deployment>> {
+    let Some(machine_id) = find_machine(conn, machine)? else {
+        return Ok(None);
+    };
+    Ok(latest(conn, machine_id)?.filter(|d| d.toplevel == toplevel))
 }
 
 /// Store a new deployment of `machine` and its closure, creating the machine
-/// on first sight. Refuses a repeat of the machine's latest deployment.
+/// on first sight. Refuses a repeat of the machine's latest deployment;
+/// callers check `unchanged` first, so this only fires if another process
+/// recorded the same system in between.
 pub fn record(
     conn: &Connection,
     machine: &str,
@@ -224,43 +255,55 @@ pub fn record(
     snapshot: &StoreSnapshot,
 ) -> Result<Deployment> {
     let tx = conn.unchecked_transaction()?;
-    ensure_new(&tx, machine, toplevel)?;
+    if let Some(existing) = unchanged(&tx, machine, toplevel)? {
+        bail!("already recorded as deployment {} for {machine}", existing.number);
+    }
     let machine_id = upsert_machine(&tx, machine)?;
     let id = insert_deployment(&tx, machine_id, toplevel, snapshot)?;
     tx.commit()?;
-    deployment(conn, id)
+    find_deployments(conn, "d.id = ?1", [id])?.pop().context("the new deployment is missing")
 }
 
-/// Resolve the two sides of a diff. With only `old` given, it is either a
-/// deployment (diffed against the latest of its machine) or a machine
-/// (whose last two deployments are diffed).
+/// The two sides of a diff, both from `machine`. With no reference its last
+/// two deployments are compared; with only `old`, that one against the
+/// latest.
 pub fn resolve_diff_pair(
     conn: &Connection,
-    old: &str,
+    machine: &str,
+    old: Option<&str>,
     new: Option<&str>,
 ) -> Result<(Deployment, Deployment)> {
-    if let Some(new) = new {
-        return Ok((resolve_deployment(conn, old)?, resolve_deployment(conn, new)?));
-    }
+    let machine_id = require_machine(conn, machine)?;
+    let Some(old) = old else {
+        let mut rows = find_deployments(
+            conn,
+            "d.target_machine_id = ?1 ORDER BY d.number DESC LIMIT 2",
+            [machine_id],
+        )?;
+        // Newest first, so popping yields old then new.
+        return match (rows.pop(), rows.pop()) {
+            (Some(old), Some(new)) => Ok((old, new)),
+            (first, _) => {
+                first.with_context(|| format!("machine {machine} has no deployments"))?;
+                bail!("machine {machine} has only one deployment, so there is nothing to diff")
+            }
+        };
+    };
 
-    if let Some(old_dep) = try_resolve_deployment(conn, old)? {
-        let new_dep = latest_deployment_for_machine(conn, old_dep.machine_id)?
-            .with_context(|| format!("no deployments for machine {}", old_dep.machine))?;
-        return Ok((old_dep, new_dep));
-    }
-
-    let machine_id = find_machine(conn, old)?
-        .with_context(|| format!("no deployment, toplevel, or machine matches: {old}"))?;
-    let mut rows =
-        find_deployments(conn, "d.target_machine_id = ?1 ORDER BY d.id DESC LIMIT 2", machine_id)?;
-    // Newest first, so popping yields old then new.
-    match (rows.pop(), rows.pop()) {
-        (Some(old_dep), Some(new_dep)) => Ok((old_dep, new_dep)),
-        (first, _) => bail!(
-            "machine {old} has fewer than two deployments ({})",
-            usize::from(first.is_some())
-        ),
-    }
+    let old = resolve_in(conn, machine_id, machine, old)?;
+    let new = if let Some(new) = new {
+        resolve_in(conn, machine_id, machine, new)?
+    } else {
+        let newest = require_latest(conn, machine_id, machine)?;
+        if newest.id == old.id {
+            bail!(
+                "deployment {} is the latest of {machine}, so there is nothing newer to diff it against",
+                old.number
+            );
+        }
+        newest
+    };
+    Ok((old, new))
 }
 
 /// Load a recorded closure back into the same shape `dix` produces when
@@ -295,25 +338,36 @@ fn find_machine(conn: &Connection, identifier: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
+fn require_machine(conn: &Connection, machine: &str) -> Result<i64> {
+    if let Some(id) = find_machine(conn, machine)? {
+        return Ok(id);
+    }
+    let known: Vec<String> = machines(conn)?.into_iter().map(|m| m.identifier).collect();
+    if known.is_empty() {
+        bail!("unknown machine: {machine} (nothing has been recorded yet)");
+    }
+    bail!("unknown machine: {machine} (known: {})", known.join(", "));
+}
+
 /// Deployments matching `filter`: the body of a `WHERE` clause over
-/// `deployments d` and `machines m`, plus any `ORDER BY`/`LIMIT`, with one
-/// `?1` parameter.
+/// `deployments d` and `machines m`, plus any `ORDER BY`/`LIMIT`.
 fn find_deployments(
     conn: &Connection,
     filter: &str,
-    param: impl rusqlite::ToSql,
+    params: impl rusqlite::Params,
 ) -> Result<Vec<Deployment>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT d.id, d.target_machine_id, m.identifier, d.created_at, d.toplevel, d.size
+        "SELECT d.id, d.number, m.identifier, datetime(d.created_at, 'localtime'),
+                d.toplevel, d.size
          FROM deployments d
          JOIN machines m ON m.id = d.target_machine_id
          WHERE {filter}"
     ))?;
     let rows = stmt
-        .query_map(params![param], |r| {
+        .query_map(params, |r| {
             Ok(Deployment {
                 id: r.get(0)?,
-                machine_id: r.get(1)?,
+                number: r.get(1)?,
                 machine: r.get(2)?,
                 created_at: r.get(3)?,
                 toplevel: r.get(4)?,
@@ -324,31 +378,51 @@ fn find_deployments(
     Ok(rows)
 }
 
-fn latest_deployment_for_machine(conn: &Connection, machine_id: i64) -> Result<Option<Deployment>> {
-    Ok(find_deployments(conn, "d.target_machine_id = ?1 ORDER BY d.id DESC LIMIT 1", machine_id)?
-        .pop())
+fn latest(conn: &Connection, machine_id: i64) -> Result<Option<Deployment>> {
+    Ok(find_deployments(
+        conn,
+        "d.target_machine_id = ?1 ORDER BY d.number DESC LIMIT 1",
+        [machine_id],
+    )?
+    .pop())
 }
 
-fn try_resolve_deployment(conn: &Connection, reference: &str) -> Result<Option<Deployment>> {
-    if let Ok(id) = reference.parse::<i64>() {
-        return Ok(find_deployments(conn, "d.id = ?1", id)?.pop());
-    }
+fn require_latest(conn: &Connection, machine_id: i64, machine: &str) -> Result<Deployment> {
+    latest(conn, machine_id)?.with_context(|| format!("machine {machine} has no deployments"))
+}
 
-    let mut rows = find_deployments(conn, "d.toplevel = ?1 ORDER BY d.id DESC", reference)?;
+/// A deployment of one machine by number or toplevel.
+fn resolve_in(
+    conn: &Connection,
+    machine_id: i64,
+    machine: &str,
+    reference: &str,
+) -> Result<Deployment> {
+    let mut rows = if let Ok(number) = reference.parse::<i64>() {
+        find_deployments(
+            conn,
+            "d.target_machine_id = ?1 AND d.number = ?2",
+            params![machine_id, number],
+        )?
+    } else {
+        find_deployments(
+            conn,
+            "d.target_machine_id = ?1 AND d.toplevel = ?2 ORDER BY d.number",
+            params![machine_id, reference],
+        )?
+    };
     if rows.len() > 1 {
-        let ids: Vec<String> = rows.iter().map(|r| r.id.to_string()).collect();
+        let numbers: Vec<String> = rows.iter().map(|d| d.number.to_string()).collect();
         bail!(
-            "toplevel {reference} matches {} deployments (ids: {}); pass an id to disambiguate",
-            rows.len(),
-            ids.join(", "),
+            "toplevel {reference} matches deployments {} of {machine}; pass a number to pick one",
+            numbers.join(", "),
         );
     }
-    Ok(rows.pop())
-}
-
-fn resolve_deployment(conn: &Connection, reference: &str) -> Result<Deployment> {
-    try_resolve_deployment(conn, reference)?
-        .with_context(|| format!("no deployment found with id or toplevel: {reference}"))
+    if let Some(deployment) = rows.pop() {
+        return Ok(deployment);
+    }
+    let newest = require_latest(conn, machine_id, machine)?;
+    bail!("machine {machine} has no deployment {reference} (the latest is {})", newest.number)
 }
 
 fn upsert_machine(conn: &Connection, identifier: &str) -> Result<i64> {
@@ -368,8 +442,12 @@ fn insert_deployment(
     toplevel: &str,
     snapshot: &StoreSnapshot,
 ) -> Result<i64> {
+    // An aggregate without GROUP BY always yields one row, so this inserts
+    // number 1 for a machine with no deployments yet.
     conn.execute(
-        "INSERT INTO deployments (target_machine_id, toplevel) VALUES (?1, ?2)",
+        "INSERT INTO deployments (target_machine_id, number, toplevel)
+         SELECT ?1, COALESCE(MAX(number), 0) + 1, ?2
+         FROM deployments WHERE target_machine_id = ?1",
         params![machine_id, toplevel],
     )?;
     let deployment_id = conn.last_insert_rowid();
@@ -446,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn record_derives_the_size_and_refuses_a_repeat_of_the_latest() {
+    fn record_numbers_each_machine_separately_and_refuses_a_repeat_of_the_latest() {
         let conn = open_in_memory();
         let first = test_path(0, "system");
         let second = test_path(1, "system");
@@ -454,30 +532,76 @@ mod tests {
         let snapshot =
             |top: &StorePath| test_snapshot(&[(top, 100), (&dep, 200), (&dep, 200)], &[&dep]);
 
+        assert!(unchanged(&conn, "host-a", first.as_str()).unwrap().is_none());
         let recorded = record(&conn, "host-a", first.as_str(), &snapshot(&first)).unwrap();
-        assert_eq!(recorded.machine, "host-a");
+        assert_eq!((recorded.machine.as_str(), recorded.number), ("host-a", 1));
         assert_eq!(recorded.size, 300, "a path listed twice is stored and counted once");
         assert_eq!(closure_len(&conn, recorded.id).unwrap(), 2);
 
+        assert_eq!(unchanged(&conn, "host-a", first.as_str()).unwrap().unwrap().number, 1);
         let err = record(&conn, "host-a", first.as_str(), &snapshot(&first)).unwrap_err();
-        assert!(err.to_string().contains("already has this system"), "{err:#}");
+        assert_eq!(err.to_string(), "already recorded as deployment 1 for host-a");
         assert_eq!(deployments(&conn, "host-a").unwrap().len(), 1, "a refusal stores nothing");
 
-        // Another machine may record the same system, and going back to an
-        // earlier system after a different one is a new deployment.
-        record(&conn, "host-b", first.as_str(), &snapshot(&first)).unwrap();
+        // Another machine may record the same system and starts at 1 again;
+        // going back to an earlier system after a different one is a new
+        // deployment.
+        let other = record(&conn, "host-b", first.as_str(), &snapshot(&first)).unwrap();
+        assert_eq!(other.number, 1);
         record(&conn, "host-a", second.as_str(), &snapshot(&second)).unwrap();
+        assert!(unchanged(&conn, "host-a", first.as_str()).unwrap().is_none());
         record(&conn, "host-a", first.as_str(), &snapshot(&first)).unwrap();
-        let ids: Vec<i64> = deployments(&conn, "host-a").unwrap().iter().map(|d| d.id).collect();
-        assert_eq!(ids.len(), 3);
-        assert!(ids.is_sorted_by(|a, b| a > b), "newest first: {ids:?}");
+        let numbers: Vec<i64> =
+            deployments(&conn, "host-a").unwrap().iter().map(|d| d.number).collect();
+        assert_eq!(numbers, [3, 2, 1], "newest first");
 
         let listed = machines(&conn).unwrap();
         assert_eq!(
             listed.iter().map(|m| (m.identifier.as_str(), m.deployments)).collect::<Vec<_>>(),
             [("host-a", 3), ("host-b", 1)]
         );
-        assert!(deployments(&conn, "host-c").unwrap_err().to_string().contains("unknown machine"));
+        let err = deployments(&conn, "host-c").unwrap_err().to_string();
+        assert_eq!(err, "unknown machine: host-c (known: host-a, host-b)");
+        let err = deployments(&open_in_memory(), "host-c").unwrap_err().to_string();
+        assert_eq!(err, "unknown machine: host-c (nothing has been recorded yet)");
+    }
+
+    #[test]
+    fn upgrading_numbers_existing_deployments_per_machine() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE machines (id INTEGER PRIMARY KEY, identifier TEXT NOT NULL UNIQUE);
+             CREATE TABLE deployments (
+                 id INTEGER PRIMARY KEY,
+                 target_machine_id INTEGER NOT NULL REFERENCES machines(id),
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 toplevel TEXT NOT NULL,
+                 size INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX idx_deployments_machine_id ON deployments(target_machine_id, id DESC);
+             INSERT INTO machines (identifier) VALUES ('host-a'), ('host-b');
+             INSERT INTO deployments (target_machine_id, toplevel) VALUES
+                 (1, '/nix/store/a1'), (2, '/nix/store/b1'), (1, '/nix/store/a2'),
+                 (2, '/nix/store/b2'), (1, '/nix/store/a3');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let numbered = |machine: &str| -> Vec<(i64, String)> {
+            let mut rows = deployments(&conn, machine).unwrap();
+            rows.reverse();
+            rows.into_iter().map(|d| (d.number, d.toplevel)).collect()
+        };
+        assert_eq!(
+            numbered("host-a"),
+            [(1, "/nix/store/a1".into()), (2, "/nix/store/a2".into()), (3, "/nix/store/a3".into())]
+        );
+        assert_eq!(numbered("host-b"), [(1, "/nix/store/b1".into()), (2, "/nix/store/b2".into())]);
+        let next = insert_deployment(&conn, 2, "/nix/store/b3", &test_snapshot(&[], &[])).unwrap();
+        assert_eq!(resolve(&conn, "host-b", None).unwrap().id, next);
+        assert_eq!(resolve(&conn, "host-b", None).unwrap().number, 3);
     }
 
     fn add_machine(conn: &Connection, identifier: &str) -> i64 {
@@ -486,7 +610,9 @@ mod tests {
 
     fn add_deployment(conn: &Connection, machine_id: i64, toplevel: &str, size: i64) -> i64 {
         conn.execute(
-            "INSERT INTO deployments (target_machine_id, toplevel, size) VALUES (?1, ?2, ?3)",
+            "INSERT INTO deployments (target_machine_id, number, toplevel, size)
+             SELECT ?1, COALESCE(MAX(number), 0) + 1, ?2, ?3
+             FROM deployments WHERE target_machine_id = ?1",
             params![machine_id, toplevel, size],
         )
         .unwrap();
@@ -637,117 +763,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_by_id() {
+    /// `host-a` with three deployments and `host-b` with one.
+    fn two_machines() -> Connection {
         let conn = open_in_memory();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-
-        let dep = resolve_deployment(&conn, &d1.to_string()).unwrap();
-        assert_eq!(dep.id, d1);
-        assert_eq!(dep.toplevel, "/nix/store/aaa-system");
+        let a = add_machine(&conn, "host-a");
+        let b = add_machine(&conn, "host-b");
+        add_deployment(&conn, a, "/nix/store/aaa-system", 100);
+        add_deployment(&conn, b, "/nix/store/zzz-system", 100);
+        add_deployment(&conn, a, "/nix/store/bbb-system", 200);
+        add_deployment(&conn, a, "/nix/store/ccc-system", 300);
+        conn
     }
 
     #[test]
-    fn resolve_by_toplevel() {
-        let conn = open_in_memory();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
+    fn resolve_accepts_a_number_or_a_toplevel_and_defaults_to_the_latest() {
+        let conn = two_machines();
+        let toplevel = |reference| resolve(&conn, "host-a", reference).unwrap().toplevel;
 
-        let dep = resolve_deployment(&conn, "/nix/store/aaa-system").unwrap();
-        assert_eq!(dep.id, d1);
+        assert_eq!(toplevel(Some("2")), "/nix/store/bbb-system");
+        assert_eq!(toplevel(Some("/nix/store/aaa-system")), "/nix/store/aaa-system");
+        assert_eq!(toplevel(None), "/nix/store/ccc-system");
+        assert_eq!(resolve(&conn, "host-b", Some("1")).unwrap().toplevel, "/nix/store/zzz-system");
     }
 
     #[test]
-    fn resolve_unknown_ref_errors() {
-        let conn = open_in_memory();
-        add_machine(&conn, "host-a");
+    fn resolve_stays_inside_the_machine() {
+        let conn = two_machines();
 
-        let err = resolve_deployment(&conn, "/nix/store/nope-system").unwrap_err();
-        assert!(err.to_string().contains("no deployment"));
+        let err = resolve(&conn, "host-b", Some("2")).unwrap_err().to_string();
+        assert_eq!(err, "machine host-b has no deployment 2 (the latest is 1)");
+        let err = resolve(&conn, "host-b", Some("/nix/store/aaa-system")).unwrap_err().to_string();
+        assert!(err.starts_with("machine host-b has no deployment /nix/store/aaa-system"), "{err}");
+        let err = resolve(&conn, "host-c", None).unwrap_err().to_string();
+        assert_eq!(err, "unknown machine: host-c (known: host-a, host-b)");
     }
 
     #[test]
-    fn resolve_ambiguous_toplevel_errors() {
-        let conn = open_in_memory();
-        let m = add_machine(&conn, "host-a");
-        add_deployment(&conn, m, "/nix/store/dup-system", 100);
-        add_deployment(&conn, m, "/nix/store/dup-system", 200);
+    fn resolve_asks_for_a_number_when_a_toplevel_repeats() {
+        let conn = two_machines();
+        let a = find_machine(&conn, "host-a").unwrap().unwrap();
+        add_deployment(&conn, a, "/nix/store/aaa-system", 100);
 
-        let err = resolve_deployment(&conn, "/nix/store/dup-system").unwrap_err();
-        assert!(err.to_string().contains("matches 2 deployments"));
+        let err = resolve(&conn, "host-a", Some("/nix/store/aaa-system")).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "toplevel /nix/store/aaa-system matches deployments 1, 4 of host-a; \
+             pass a number to pick one"
+        );
     }
 
     #[test]
-    fn diff_pair_two_args_resolves_both() {
-        let conn = open_in_memory();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-        let d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
+    fn diff_pair_defaults_to_the_last_two_then_to_the_latest() {
+        let conn = two_machines();
+        let numbers = |old, new| {
+            let (old, new) = resolve_diff_pair(&conn, "host-a", old, new).unwrap();
+            (old.number, new.number)
+        };
 
-        let (old, new) =
-            resolve_diff_pair(&conn, &d1.to_string(), Some("/nix/store/bbb-system")).unwrap();
-        assert_eq!(old.id, d1);
-        assert_eq!(new.id, d2);
+        assert_eq!(numbers(None, None), (2, 3));
+        assert_eq!(numbers(Some("1"), None), (1, 3));
+        assert_eq!(numbers(Some("1"), Some("/nix/store/bbb-system")), (1, 2));
+        assert_eq!(numbers(Some("3"), Some("1")), (3, 1));
     }
 
     #[test]
-    fn diff_pair_single_id_uses_latest_for_machine() {
-        let conn = open_in_memory();
-        let m = add_machine(&conn, "host-a");
-        let d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-        let _d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
-        let d3 = add_deployment(&conn, m, "/nix/store/ccc-system", 300);
+    fn diff_pair_explains_when_there_is_nothing_to_compare() {
+        let conn = two_machines();
+        let error = |machine, old, new| {
+            resolve_diff_pair(&conn, machine, old, new).unwrap_err().to_string()
+        };
 
-        let (old, new) = resolve_diff_pair(&conn, &d1.to_string(), None).unwrap();
-        assert_eq!(old.id, d1);
-        assert_eq!(new.id, d3);
-    }
-
-    #[test]
-    fn diff_pair_machine_name_uses_last_two() {
-        let conn = open_in_memory();
-        let m = add_machine(&conn, "host-a");
-        let _d1 = add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-        let d2 = add_deployment(&conn, m, "/nix/store/bbb-system", 200);
-        let d3 = add_deployment(&conn, m, "/nix/store/ccc-system", 300);
-
-        let (old, new) = resolve_diff_pair(&conn, "host-a", None).unwrap();
-        assert_eq!(old.id, d2);
-        assert_eq!(new.id, d3);
-    }
-
-    #[test]
-    fn diff_pair_machine_with_one_deployment_errors() {
-        let conn = open_in_memory();
-        let m = add_machine(&conn, "host-a");
-        add_deployment(&conn, m, "/nix/store/aaa-system", 100);
-
-        let err = resolve_diff_pair(&conn, "host-a", None).unwrap_err();
-        assert!(err.to_string().contains("fewer than two deployments"));
-    }
-
-    #[test]
-    fn diff_pair_unknown_single_ref_errors() {
-        let conn = open_in_memory();
-        add_machine(&conn, "host-a");
-
-        let err = resolve_diff_pair(&conn, "host-b", None).unwrap_err();
-        assert!(err.to_string().contains("no deployment, toplevel, or machine"));
-    }
-
-    #[test]
-    fn diff_pair_id_lookup_does_not_match_unrelated_machine() {
-        let conn = open_in_memory();
-        let m_a = add_machine(&conn, "host-a");
-        let m_b = add_machine(&conn, "host-b");
-        let d_a = add_deployment(&conn, m_a, "/nix/store/aaa-system", 100);
-        let _d_b1 = add_deployment(&conn, m_b, "/nix/store/bbb-system", 200);
-        let _d_b2 = add_deployment(&conn, m_b, "/nix/store/ccc-system", 300);
-
-        let (old, new) = resolve_diff_pair(&conn, &d_a.to_string(), None).unwrap();
-        assert_eq!(old.id, d_a);
-        assert_eq!(new.id, d_a);
-        assert_eq!(new.machine_id, m_a);
+        assert_eq!(
+            error("host-b", None, None),
+            "machine host-b has only one deployment, so there is nothing to diff"
+        );
+        assert_eq!(
+            error("host-a", Some("3"), None),
+            "deployment 3 is the latest of host-a, so there is nothing newer to diff it against"
+        );
+        assert_eq!(
+            error("host-b", Some("1"), Some("3")),
+            "machine host-b has no deployment 3 (the latest is 1)"
+        );
+        assert_eq!(error("host-c", None, None), "unknown machine: host-c (known: host-a, host-b)");
     }
 }

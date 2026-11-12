@@ -39,11 +39,12 @@ List what you've recorded:
 ```sh
 lethe machines              # all known machines
 lethe deployments my-server # deployments for one machine
-lethe show 42               # details of a single deployment
-lethe diff 41 42            # diff two deployments (closure + size delta)
-lethe diff 41               # diff against the latest deployment of the same machine
-lethe diff my-server        # diff the last two deployments for a machine
-lethe diff /nix/store/...-nixos-system-foo 42  # ids and toplevel paths are interchangeable
+lethe show my-server        # details of the latest deployment of a machine
+lethe show my-server 3      # details of one deployment
+lethe diff my-server        # diff the last two deployments (closure + size delta)
+lethe diff my-server 3      # diff deployment 3 against the latest
+lethe diff my-server 3 5    # diff two deployments
+lethe diff my-server /nix/store/...-nixos-system-foo 5  # numbers and toplevel paths are interchangeable
 ```
 
 ## Data Storage
