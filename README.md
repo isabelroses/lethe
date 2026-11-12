@@ -11,10 +11,10 @@ Named after the river of oblivion, but it does the opposite.
 
 ## Usage
 
-Record the current local system:
+Record the machine you are on:
 
 ```sh
-lethe record --local
+lethe record
 ```
 
 Record a remote machine over SSH:

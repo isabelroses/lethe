@@ -52,7 +52,7 @@ pub fn record(
 pub fn machines(conn: &Connection, out: &mut impl Write) -> Result<()> {
     let machines = db::machines(conn)?;
     if machines.is_empty() {
-        writeln!(out, "nothing recorded yet; try `lethe record --local`")?;
+        writeln!(out, "nothing recorded yet; try `lethe record`")?;
         return Ok(());
     }
     let rows = machines.into_iter().map(|m| {
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn machines_says_so_when_nothing_is_recorded() {
         let out = rendered(|out| machines(&open_in_memory(), out));
-        assert_eq!(out, "nothing recorded yet; try `lethe record --local`\n");
+        assert_eq!(out, "nothing recorded yet; try `lethe record`\n");
     }
 
     #[test]

@@ -33,13 +33,8 @@ enum Command {
     /// Record a new deployment for a machine
     Record {
         /// SSH target: [user@]host[:port] or ssh[-ng]://[user@]host[:port].
-        /// Uses ssh-ng unless ssh:// is given. Omit when using --local.
-        #[arg(required_unless_present = "local")]
+        /// Uses ssh-ng unless ssh:// is given [default: this machine]
         target: Option<String>,
-
-        /// Record the local system instead of going over SSH
-        #[arg(long, conflicts_with = "target")]
-        local: bool,
 
         /// Machine identifier to record under [default: the target's short hostname]
         #[arg(long)]
@@ -130,12 +125,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let conn = db::open(cli.db)?;
     let out = &mut std::io::stdout().lock();
     match cli.command {
-        Command::Record { target, local, name, system_link } => {
-            let nix_target = if local {
-                nix::Target::Local
-            } else {
-                let raw = target.expect("clap enforces this via required_unless_present");
-                nix::Target::Ssh(nix::parse_ssh_target(&raw)?)
+        Command::Record { target, name, system_link } => {
+            let nix_target = match target {
+                Some(raw) => nix::Target::Ssh(nix::parse_ssh_target(&raw)?),
+                None => nix::Target::Local,
             };
             cli::record(&conn, out, name.as_deref(), &nix_target, &system_link)
         }
