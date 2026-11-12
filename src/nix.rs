@@ -5,7 +5,6 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use dix::{Store, StorePath, StorePathInfo, StoreSnapshot};
-use tracing::debug;
 
 pub enum Target {
     Local,
@@ -178,21 +177,17 @@ fn parse_identity(reply: &str, with_hostname: bool) -> (Vec<String>, String, Str
     (lines, resolved.unwrap_or_default(), hostname.unwrap_or_default())
 }
 
-const PROC_HOSTNAME: &str = "/proc/sys/kernel/hostname";
-
 fn local_hostname() -> Result<String> {
-    // Avoids depending on `hostname(1)`, which isn't always installed.
-    match std::fs::read_to_string(PROC_HOSTNAME) {
-        Ok(raw) => Ok(raw),
-        Err(e) => {
-            debug!("reading {PROC_HOSTNAME} failed ({e}), falling back to hostname(1)");
-            output_of(Command::new("hostname").arg("-s"), "hostname -s")
-        }
-    }
+    // A system call rather than `hostname(1)`: there is no process to spawn,
+    // and the command isn't always installed.
+    hostname::get()
+        .context("reading the hostname")?
+        .into_string()
+        .map_err(|_| anyhow!("hostname is not valid unicode"))
 }
 
 /// Reduce a hostname to its short form the way `hostname -s` does, so a local
-/// `/proc` read and a remote `hostname -s` agree on the stored identifier.
+/// `gethostname` and a remote `hostname -s` agree on the stored identifier.
 fn short_hostname(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     let short = trimmed.split('.').next().unwrap_or(trimmed);
