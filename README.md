@@ -53,6 +53,49 @@ The database lives at `$XDG_DATA_HOME/lethe/lethe.db` (typically
 `~/.local/share/lethe/lethe.db`). You can change this with `--db <path>` or the
 `LETHE_DB` environment variable.
 
+## Syncing between devices
+
+If you deploy from more than one machine, run a sync server on one always-on
+host and let every orchestrator sync with it. Each deployment carries a stable
+uuid, so syncing is safe to repeat and never duplicates anything. A machine's
+deployments are numbered by when they were made, so a pulled deployment
+slots in where it happened and every device ends up with the same numbers;
+the numbers `show` and `diff` take can therefore shift after a sync.
+
+On the server (or use the NixOS module, below):
+
+```sh
+lethe serve --listen 0.0.0.0:7374 --token-file /run/secrets/lethe-token
+```
+
+On each orchestrator:
+
+```sh
+export LETHE_SYNC_SERVER=http://freyja:7374
+export LETHE_SYNC_TOKEN_FILE=~/.config/lethe/token
+lethe sync   # pushes what you recorded, pulls everyone else's
+```
+
+`LETHE_SYNC_TOKEN` also works in place of a token file. `lethe` doesn't do TLS
+itself. Keep the server on a private network such as a tailnet, or put a
+reverse proxy in front of it and use an `https://` URL.
+
+### NixOS module
+
+```nix
+{
+  imports = [ inputs.lethe.nixosModules.default ];
+
+  services.lethe-server = {
+    enable = true;
+    listenAddress = "0.0.0.0";
+    tokenFile = config.age.secrets.lethe-token.path;
+  };
+  # only reachable over the tailnet
+  networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 7374 ];
+}
+```
+
 ## A little lore
 
 `lethe` is named after [Lethe](https://en.wikipedia.org/wiki/Lethe) one of the

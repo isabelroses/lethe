@@ -23,21 +23,32 @@ CREATE TABLE IF NOT EXISTS store_paths (
 );
 
 -- `id` is the key closures point at. `number` counts the deployments of one
--- machine from 1 and is the name users see.
+-- machine from 1 and is the name users see. `uuid` names the deployment on
+-- every device it is synced to; nullable only because `ALTER TABLE` cannot add
+-- a `NOT NULL` column without a default, and `migrate` fills it in.
 CREATE TABLE IF NOT EXISTS deployments (
     id INTEGER PRIMARY KEY,
     target_machine_id INTEGER NOT NULL REFERENCES machines(id),
     number INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     toplevel TEXT NOT NULL,
-    size INTEGER NOT NULL DEFAULT 0
+    size INTEGER NOT NULL DEFAULT 0,
+    uuid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS closures (
-    store_path_id INTEGER NOT NULL REFERENCES store_paths(id),
     deployment_id INTEGER NOT NULL REFERENCES deployments(id),
+    store_path_id INTEGER NOT NULL REFERENCES store_paths(id),
     selected INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (store_path_id, deployment_id)
+    PRIMARY KEY (deployment_id, store_path_id)
+) WITHOUT ROWID;
+
+-- How far this device has synced with each server: the server sequence it
+-- has pulled up to, and the local deployment id it has pushed up to.
+CREATE TABLE IF NOT EXISTS sync_state (
+    remote TEXT PRIMARY KEY,
+    last_pulled_seq INTEGER NOT NULL DEFAULT 0,
+    last_pushed_id INTEGER NOT NULL DEFAULT 0
 );
 ";
 
@@ -46,14 +57,11 @@ CREATE TABLE IF NOT EXISTS closures (
 const INDEXES: &str = r"
 CREATE INDEX IF NOT EXISTS idx_deployments_machine_toplevel ON deployments(target_machine_id, toplevel);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_machine_number ON deployments(target_machine_id, number);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_uuid ON deployments(uuid);
 
--- Reads filter on `deployment_id`, which the primary key sorts second and so
--- cannot serve. The trailing columns make this index covering.
-CREATE INDEX IF NOT EXISTS idx_closures_deployment
-    ON closures(deployment_id, store_path_id, selected);
 ";
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub fn open(override_path: Option<PathBuf>) -> Result<Connection> {
     let path = match override_path {
@@ -93,6 +101,14 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
     tx.execute_batch(INDEXES).context("creating indexes")?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
+
+    // Rebuilding a table leaves the old copy's pages free; hand them back
+    // once rather than carrying a file twice the size of its data.
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let free: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    if free * 4 > pages {
+        conn.execute_batch("VACUUM").context("compacting the database after upgrading it")?;
+    }
     Ok(())
 }
 
@@ -104,6 +120,31 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE closures ADD COLUMN selected INTEGER NOT NULL DEFAULT 0", [])?;
     }
 
+    // Closures used to be a rowid table with a primary key led by the store
+    // path, plus an index by deployment for the reads. Keyed by deployment
+    // without a rowid, each row lives in one b-tree instead of three, which
+    // halves the cost of storing a closure and shrinks the file.
+    let without_rowid: bool = conn.query_row(
+        "SELECT wr FROM pragma_table_list WHERE schema = 'main' AND name = 'closures'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !without_rowid {
+        conn.execute_batch(
+            "CREATE TABLE closures_by_deployment (
+                 deployment_id INTEGER NOT NULL REFERENCES deployments(id),
+                 store_path_id INTEGER NOT NULL REFERENCES store_paths(id),
+                 selected INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (deployment_id, store_path_id)
+             ) WITHOUT ROWID;
+             INSERT INTO closures_by_deployment (deployment_id, store_path_id, selected)
+                 SELECT deployment_id, store_path_id, selected FROM closures
+                 ORDER BY deployment_id, store_path_id;
+             DROP TABLE closures;
+             ALTER TABLE closures_by_deployment RENAME TO closures;",
+        )?;
+    }
+
     if !has_column(conn, "deployments", "number")? {
         conn.execute_batch(
             "ALTER TABLE deployments ADD COLUMN number INTEGER NOT NULL DEFAULT 0;
@@ -113,6 +154,19 @@ fn migrate(conn: &Connection) -> Result<()> {
                    AND earlier.id <= deployments.id
              );",
         )?;
+    }
+
+    if !has_column(conn, "deployments", "uuid")? {
+        conn.execute("ALTER TABLE deployments ADD COLUMN uuid TEXT", [])?;
+        // In id order, so the time-ordered uuids keep the recorded order.
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM deployments ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut set = conn.prepare("UPDATE deployments SET uuid = ?1 WHERE id = ?2")?;
+        for id in ids {
+            set.execute(params![new_uuid(), id])?;
+        }
     }
 
     conn.execute_batch(
@@ -139,6 +193,12 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(conn
         .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
         .exists(rusqlite::params![table, column])?)
+}
+
+/// A fresh deployment identity. v7 is time-ordered, so uuids made on one
+/// device sort in the order they were made.
+fn new_uuid() -> String {
+    uuid::Uuid::now_v7().hyphenated().to_string()
 }
 
 fn default_path() -> Result<PathBuf> {
@@ -259,7 +319,8 @@ pub fn record(
         bail!("already recorded as deployment {} for {machine}", existing.number);
     }
     let machine_id = upsert_machine(&tx, machine)?;
-    let id = insert_deployment(&tx, machine_id, toplevel, snapshot)?;
+    let uuid = new_uuid();
+    let id = insert_deployment(&tx, &Origin::fresh(&uuid), machine_id, toplevel, snapshot)?;
     tx.commit()?;
     find_deployments(conn, "d.id = ?1", [id])?.pop().context("the new deployment is missing")
 }
@@ -329,6 +390,195 @@ pub fn load_snapshot(conn: &Connection, deployment_id: i64) -> Result<StoreSnaps
     }
 
     Ok(StoreSnapshot { closure, selected })
+}
+
+/// A deployment as it travels between devices: named by its uuid, with no
+/// local id or number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Portable {
+    pub uuid: String,
+    pub machine: String,
+    /// UTC, in `SQLite`'s `datetime('now')` format.
+    pub created_at: String,
+    pub toplevel: String,
+    pub snapshot: StoreSnapshot,
+}
+
+/// Deployments with an id above `after_id`, oldest first, each with its id.
+pub fn portable_after(
+    conn: &Connection,
+    after_id: i64,
+    limit: usize,
+) -> Result<Vec<(i64, Portable)>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    find_portables(conn, "d.id > ?1 ORDER BY d.id LIMIT ?2", params![after_id, limit])
+}
+
+/// The deployments named by `uuids` that exist here, in no particular order.
+pub fn portables_by_uuid(conn: &Connection, uuids: &[String]) -> Result<Vec<Portable>> {
+    let mut found = Vec::with_capacity(uuids.len());
+    for uuid in uuids {
+        found.extend(find_portables(conn, "d.uuid = ?1", [uuid])?.into_iter().map(|(_, d)| d));
+    }
+    Ok(found)
+}
+
+/// The uuids of deployments with an id above `after_id`, oldest first, each
+/// with its id: a cheap listing for clients to pick from.
+pub fn uuids_after(conn: &Connection, after_id: i64, limit: usize) -> Result<Vec<(i64, String)>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    Ok(conn
+        .prepare_cached(
+            "SELECT id, uuid FROM deployments WHERE id > ?1 AND uuid IS NOT NULL
+             ORDER BY id LIMIT ?2",
+        )?
+        .query_map(params![after_id, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Which of `uuids` this database has never seen, in the given order.
+pub fn unknown_uuids(conn: &Connection, uuids: &[String]) -> Result<Vec<String>> {
+    let mut known = conn.prepare_cached("SELECT 1 FROM deployments WHERE uuid = ?1")?;
+    let mut unknown = Vec::new();
+    for uuid in uuids {
+        if !known.exists([uuid])? {
+            unknown.push(uuid.clone());
+        }
+    }
+    Ok(unknown)
+}
+
+/// Deployments matching `filter`, as in [`find_deployments`], with their ids.
+fn find_portables(
+    conn: &Connection,
+    filter: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<(i64, Portable)>> {
+    let rows: Vec<(i64, String, String, String, String)> = conn
+        .prepare_cached(&format!(
+            "SELECT d.id, d.uuid, m.identifier, d.created_at, d.toplevel
+             FROM deployments d
+             JOIN machines m ON m.id = d.target_machine_id
+             WHERE {filter}"
+        ))?
+        .query_map(params, |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    rows.into_iter()
+        .map(|(id, uuid, machine, created_at, toplevel)| {
+            let snapshot = load_snapshot(conn, id)?;
+            Ok((id, Portable { uuid, machine, created_at, toplevel, snapshot }))
+        })
+        .collect()
+}
+
+/// Store the deployments whose uuid is new here, keeping their creation
+/// time, and return how many that was. The caller provides the transaction.
+///
+/// Each machine that gained a deployment is renumbered by creation time, so
+/// one pulled from another device slots in where it happened rather than
+/// becoming the latest.
+pub fn import(conn: &Connection, deployments: &[Portable]) -> Result<usize> {
+    let mut known = conn.prepare_cached("SELECT 1 FROM deployments WHERE uuid = ?1")?;
+    let mut touched = HashSet::new();
+    let mut inserted = 0;
+    for d in deployments {
+        if known.exists(params![d.uuid])? {
+            continue;
+        }
+        let machine_id = upsert_machine(conn, &d.machine)?;
+        let origin = Origin { uuid: &d.uuid, created_at: Some(&d.created_at) };
+        insert_deployment(conn, &origin, machine_id, &d.toplevel, &d.snapshot)
+            .with_context(|| format!("importing deployment {}", d.uuid))?;
+        touched.insert(machine_id);
+        inserted += 1;
+    }
+    for machine_id in touched {
+        renumber(conn, machine_id)?;
+    }
+    Ok(inserted)
+}
+
+/// Where syncing with one server left off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cursors {
+    /// The highest server sequence pulled.
+    pub pulled: i64,
+    /// The highest local deployment id pushed or known to be on the server.
+    pub pushed: i64,
+}
+
+pub fn cursors(conn: &Connection, remote: &str) -> Result<Cursors> {
+    Ok(conn
+        .query_row(
+            "SELECT last_pulled_seq, last_pushed_id FROM sync_state WHERE remote = ?1",
+            params![remote],
+            |r| Ok(Cursors { pulled: r.get(0)?, pushed: r.get(1)? }),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
+pub fn save_cursors(conn: &Connection, remote: &str, cursors: Cursors) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_state (remote, last_pulled_seq, last_pushed_id) VALUES (?1, ?2, ?3)
+         ON CONFLICT(remote) DO UPDATE
+         SET last_pulled_seq = excluded.last_pulled_seq, last_pushed_id = excluded.last_pushed_id",
+        params![remote, cursors.pulled, cursors.pushed],
+    )?;
+    Ok(())
+}
+
+/// Store a page pulled from `remote`, whose last row has sequence `seq`, and
+/// advance the cursors with it in one transaction. Returns how many rows
+/// were new here.
+pub fn store_pulled(
+    conn: &Connection,
+    remote: &str,
+    deployments: &[Portable],
+    seq: i64,
+    cursors: &mut Cursors,
+) -> Result<usize> {
+    // Immediate, so no local `record` can slip in between reading the newest
+    // id and writing the cursors back.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let newest = |tx: &Connection| {
+        tx.query_row("SELECT COALESCE(MAX(id), 0) FROM deployments", [], |r| r.get::<_, i64>(0))
+    };
+    let nothing_unpushed = cursors.pushed == newest(&tx)?;
+    let inserted = import(&tx, deployments)?;
+    cursors.pulled = seq;
+    // Rows just pulled came from the server, so skip past them, but only
+    // when nothing local is still waiting to be pushed beneath them.
+    if nothing_unpushed {
+        cursors.pushed = newest(&tx)?;
+    }
+    save_cursors(&tx, remote, *cursors)?;
+    tx.commit()?;
+    Ok(inserted)
+}
+
+/// Number a machine's deployments by creation time, so every device holding
+/// the same deployments numbers them alike. Ties fall to the uuid, which is
+/// the same everywhere, where the local id is not.
+fn renumber(conn: &Connection, machine_id: i64) -> Result<()> {
+    // Only rows whose number moves are written, which for a deployment that is
+    // simply the newest is none. `number` is unique per machine and checked
+    // row by row, so those rows park on the negated target first, where they
+    // cannot collide with each other or with rows that keep their number.
+    conn.prepare_cached(
+        "UPDATE deployments SET number = -ranked.number
+         FROM (
+             SELECT id, ROW_NUMBER() OVER (ORDER BY created_at, uuid) AS number
+             FROM deployments WHERE target_machine_id = ?1
+         ) AS ranked
+         WHERE deployments.id = ranked.id AND deployments.number != ranked.number",
+    )?
+    .execute(params![machine_id])?;
+    conn.prepare_cached(
+        "UPDATE deployments SET number = -number WHERE target_machine_id = ?1 AND number < 0",
+    )?
+    .execute(params![machine_id])?;
+    Ok(())
 }
 
 fn find_machine(conn: &Connection, identifier: &str) -> Result<Option<i64>> {
@@ -435,9 +685,24 @@ fn upsert_machine(conn: &Connection, identifier: &str) -> Result<i64> {
         .query_row(params![identifier], |r| r.get(0))?)
 }
 
+/// Where a deployment comes from: made here just now, or carried over from
+/// another device with the identity and time it was made with.
+struct Origin<'a> {
+    uuid: &'a str,
+    /// `None` for now.
+    created_at: Option<&'a str>,
+}
+
+impl Origin<'_> {
+    fn fresh(uuid: &str) -> Origin<'_> {
+        Origin { uuid, created_at: None }
+    }
+}
+
 /// The caller provides the transaction.
 fn insert_deployment(
     conn: &Connection,
+    origin: &Origin,
     machine_id: i64,
     toplevel: &str,
     snapshot: &StoreSnapshot,
@@ -445,10 +710,10 @@ fn insert_deployment(
     // An aggregate without GROUP BY always yields one row, so this inserts
     // number 1 for a machine with no deployments yet.
     conn.execute(
-        "INSERT INTO deployments (target_machine_id, number, toplevel)
-         SELECT ?1, COALESCE(MAX(number), 0) + 1, ?2
+        "INSERT INTO deployments (target_machine_id, number, toplevel, uuid, created_at)
+         SELECT ?1, COALESCE(MAX(number), 0) + 1, ?2, ?3, COALESCE(?4, datetime('now'))
          FROM deployments WHERE target_machine_id = ?1",
-        params![machine_id, toplevel],
+        params![machine_id, toplevel, origin.uuid, origin.created_at],
     )?;
     let deployment_id = conn.last_insert_rowid();
 
@@ -599,9 +864,72 @@ mod tests {
             [(1, "/nix/store/a1".into()), (2, "/nix/store/a2".into()), (3, "/nix/store/a3".into())]
         );
         assert_eq!(numbered("host-b"), [(1, "/nix/store/b1".into()), (2, "/nix/store/b2".into())]);
-        let next = insert_deployment(&conn, 2, "/nix/store/b3", &test_snapshot(&[], &[])).unwrap();
+        let uuids: Vec<String> = conn
+            .prepare("SELECT uuid FROM deployments ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(uuids.len(), 5);
+        assert!(uuids.is_sorted(), "backfilled in id order: {uuids:?}");
+        let next = insert(&conn, 2, "/nix/store/b3", &test_snapshot(&[], &[]));
         assert_eq!(resolve(&conn, "host-b", None).unwrap().id, next);
         assert_eq!(resolve(&conn, "host-b", None).unwrap().number, 3);
+    }
+
+    fn insert(conn: &Connection, machine_id: i64, toplevel: &str, snapshot: &StoreSnapshot) -> i64 {
+        insert_deployment(conn, &Origin::fresh(&new_uuid()), machine_id, toplevel, snapshot).unwrap()
+    }
+
+    #[test]
+    fn upgrading_rekeys_closures_by_deployment() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE machines (id INTEGER PRIMARY KEY, identifier TEXT NOT NULL UNIQUE);
+             CREATE TABLE store_paths (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, nar_size INTEGER NOT NULL);
+             CREATE TABLE deployments (
+                 id INTEGER PRIMARY KEY,
+                 target_machine_id INTEGER NOT NULL REFERENCES machines(id),
+                 number INTEGER NOT NULL,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 toplevel TEXT NOT NULL,
+                 size INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE closures (
+                 store_path_id INTEGER NOT NULL REFERENCES store_paths(id),
+                 deployment_id INTEGER NOT NULL REFERENCES deployments(id),
+                 selected INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (store_path_id, deployment_id)
+             );
+             CREATE INDEX idx_closures_deployment ON closures(deployment_id, store_path_id, selected);
+             INSERT INTO machines (identifier) VALUES ('host-a');
+             INSERT INTO store_paths (path, nar_size) VALUES
+                 ('/nix/store/00000000000000000000000000000000-foo', 100),
+                 ('/nix/store/00000000000000000000000000000001-bar', 200);
+             INSERT INTO deployments (target_machine_id, number, toplevel) VALUES (1, 1, '/nix/store/a');
+             INSERT INTO closures VALUES (1, 1, 1), (2, 1, 0);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let wr: bool = conn
+            .query_row("SELECT wr FROM pragma_table_list WHERE name = 'closures'", [], |r| r.get(0))
+            .unwrap();
+        assert!(wr);
+        let snapshot = load_snapshot(&conn, 1).unwrap();
+        assert_eq!(snapshot.closure.len(), 2);
+        assert_eq!(snapshot.selected.len(), 1);
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('idx_closures_deployment', 'closures_by_deployment')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0);
     }
 
     fn add_machine(conn: &Connection, identifier: &str) -> i64 {
@@ -683,8 +1011,7 @@ mod tests {
         let snapshot = |changed_size| {
             test_snapshot(&[(&changed, changed_size), (&unchanged, 200)], &[&changed])
         };
-        let first = insert_deployment(&conn, machine, changed.as_str(), &snapshot(100))
-            .unwrap();
+        let first = insert(&conn, machine, changed.as_str(), &snapshot(100));
         conn.execute_batch(
             "CREATE TEMP TABLE size_updates (path TEXT);
              CREATE TEMP TRIGGER count_size_updates AFTER UPDATE ON store_paths
@@ -692,8 +1019,7 @@ mod tests {
         )
         .unwrap();
 
-        let second = insert_deployment(&conn, machine, changed.as_str(), &snapshot(150))
-            .unwrap();
+        let second = insert(&conn, machine, changed.as_str(), &snapshot(150));
 
         for id in [first, second] {
             let loaded = load_snapshot(&conn, id).unwrap();
@@ -728,7 +1054,7 @@ mod tests {
         let machine = upsert_machine(&conn, "host-a").unwrap();
         let path = test_path(0, "system");
         let snapshot = test_snapshot(&[(&path, 100), (&path, 150)], &[&path]);
-        let deployment = insert_deployment(&conn, machine, path.as_str(), &snapshot).unwrap();
+        let deployment = insert(&conn, machine, path.as_str(), &snapshot);
         let loaded = load_snapshot(&conn, deployment).unwrap();
         assert_eq!(loaded.closure.len(), 1);
         assert_eq!(loaded.closure[0].nar_size.bytes(), 150);
@@ -753,7 +1079,7 @@ mod tests {
                     .collect(),
                 selected: paths[..selected_count].to_vec(),
             };
-            let id = insert_deployment(&conn, machine, paths[0].as_str(), &snapshot).unwrap();
+            let id = insert(&conn, machine, paths[0].as_str(), &snapshot);
             let loaded = load_snapshot(&conn, id).unwrap();
             assert_eq!(loaded.closure.len(), paths.len());
             assert_eq!(
@@ -846,5 +1172,73 @@ mod tests {
             "machine host-b has no deployment 3 (the latest is 1)"
         );
         assert_eq!(error("host-c", None, None), "unknown machine: host-c (known: host-a, host-b)");
+    }
+
+    fn portable(machine: &str, toplevel: &StorePath, created_at: &str) -> Portable {
+        let dep = test_path(9, "dependency");
+        Portable {
+            uuid: new_uuid(),
+            machine: machine.into(),
+            created_at: created_at.into(),
+            toplevel: toplevel.as_str().into(),
+            snapshot: test_snapshot(&[(toplevel, 100), (&dep, 200)], &[&dep]),
+        }
+    }
+
+    #[test]
+    fn import_keeps_identity_and_time_and_skips_known_uuids() {
+        let conn = open_in_memory();
+        let d = portable("host-a", &test_path(0, "system"), "2020-01-02 03:04:05");
+
+        assert_eq!(import(&conn, std::slice::from_ref(&d)).unwrap(), 1);
+        assert_eq!(import(&conn, std::slice::from_ref(&d)).unwrap(), 0);
+
+        let exported = portable_after(&conn, 0, 10).unwrap();
+        assert_eq!(exported.len(), 1);
+        let (_, mut back) = exported.into_iter().next().unwrap();
+        back.snapshot.closure.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut want = d;
+        want.snapshot.closure.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(back, want);
+        assert_eq!(resolve(&conn, "host-a", None).unwrap().size, 300);
+    }
+
+    #[test]
+    fn import_renumbers_by_creation_time() {
+        let conn = open_in_memory();
+        let (a, b, c) = (test_path(0, "system"), test_path(1, "system"), test_path(2, "system"));
+        let snapshot = |top: &StorePath| test_snapshot(&[(top, 100)], &[]);
+        record(&conn, "host-a", a.as_str(), &snapshot(&a)).unwrap();
+        conn.execute("UPDATE deployments SET created_at = '2020-01-01 00:00:00'", []).unwrap();
+        record(&conn, "host-a", c.as_str(), &snapshot(&c)).unwrap();
+
+        // Made on another device between the two local ones.
+        import(&conn, &[portable("host-a", &b, "2021-01-01 00:00:00")]).unwrap();
+
+        let numbered: Vec<(i64, String)> = deployments(&conn, "host-a")
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.number, d.toplevel))
+            .collect();
+        assert_eq!(
+            numbered,
+            [(3, c.as_str().into()), (2, b.as_str().into()), (1, a.as_str().into())]
+        );
+        assert!(unchanged(&conn, "host-a", c.as_str()).unwrap().is_some(), "the latest stays");
+    }
+
+    #[test]
+    fn portable_after_pages_in_id_order() {
+        let conn = open_in_memory();
+        let machine = add_machine(&conn, "host-a");
+        for i in 0..3 {
+            let top = test_path(i, "system");
+            insert(&conn, machine, top.as_str(), &test_snapshot(&[(&top, 1)], &[]));
+        }
+        let ids = |after, limit| -> Vec<i64> {
+            portable_after(&conn, after, limit).unwrap().into_iter().map(|(id, _)| id).collect()
+        };
+        assert_eq!(ids(0, 2), [1, 2]);
+        assert_eq!(ids(2, 2), [3]);
     }
 }

@@ -1,10 +1,13 @@
 mod cli;
 mod db;
 mod nix;
+mod sync;
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use anyhow::Context as _;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use tracing_subscriber::EnvFilter;
@@ -76,6 +79,28 @@ enum Command {
         new: Option<String>,
     },
 
+    /// Serve this database to other devices running `lethe sync`
+    Serve {
+        /// Address to listen on
+        #[arg(long, env = "LETHE_LISTEN", default_value = "127.0.0.1:7374")]
+        listen: String,
+
+        /// File holding the shared sync token (falls back to `LETHE_SYNC_TOKEN`)
+        #[arg(long, env = "LETHE_SYNC_TOKEN_FILE", value_name = "PATH")]
+        token_file: Option<PathBuf>,
+    },
+
+    /// Push local deployments to a sync server and pull everyone else's
+    Sync {
+        /// Sync server URL, e.g. `http://freyja:7374`
+        #[arg(long, env = "LETHE_SYNC_SERVER", value_name = "URL")]
+        server: String,
+
+        /// File holding the shared sync token (falls back to `LETHE_SYNC_TOKEN`)
+        #[arg(long, env = "LETHE_SYNC_TOKEN_FILE", value_name = "PATH")]
+        token_file: Option<PathBuf>,
+    },
+
     /// Print a shell completion script to stdout
     Completions {
         /// Target shell (bash, zsh, fish, elvish, powershell)
@@ -140,6 +165,28 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Diff { machine, old, new } => {
             cli::diff(&conn, out, &machine, old.as_deref(), new.as_deref())
         }
+        Command::Serve { listen, token_file } => {
+            let token = resolve_token(token_file.as_deref())?;
+            sync::server::bind(&listen, conn, &token)?.run()
+        }
+        Command::Sync { server, token_file } => {
+            let token = resolve_token(token_file.as_deref())?;
+            let report = sync::client::sync(&conn, &server, &token)?;
+            writeln!(out, "pushed {}, pulled {} deployments ({server})", report.pushed, report.pulled)?;
+            Ok(())
+        }
         Command::Completions { .. } => unreachable!(),
     }
+}
+
+/// A file keeps the token out of shell history and works with agenix/sops;
+/// the env var is there for quick local use.
+fn resolve_token(file: Option<&Path>) -> anyhow::Result<String> {
+    if let Some(path) = file {
+        let token = std::fs::read_to_string(path)
+            .with_context(|| format!("reading token file {}", path.display()))?;
+        return Ok(token.trim().to_string());
+    }
+    std::env::var("LETHE_SYNC_TOKEN")
+        .map_err(|_| anyhow::anyhow!("no sync token: pass --token-file or set LETHE_SYNC_TOKEN"))
 }

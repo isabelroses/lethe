@@ -16,10 +16,16 @@ rusqlite = { version = "0.40", default-features = false, features = [
   "bundled",
   "cache",
 ] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 tabled = { version = "0.22.0", default-features = false, features = ["std"] }
+tiny_http = "0.12.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls", "json"] }
+uuid = { version = "1.29.2", features = ["v7"] }
 yansi = { version = "1.0.1", features = ["detect-env", "detect-tty"] }
+zstd = "0.13.3"
 
 [profile.release]
 opt-level = "s"
